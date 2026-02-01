@@ -77,9 +77,12 @@ class CryptoBot:
   /intervals  - 显示支持的周期
   /traders [id] [-p]  - 查看/修改交易者档案 (查看仓位使用 -p)
   /newtrader [prompt]  - Generate new trader using AI
+  /newindicator <prompt>  - Generate new indicator using AI
+  /indicators  - 查看已有的指标脚本
   /decide <trader_id>  - AI 自动交易决策 (CSV 指标)
   /openposition <trader_id> <exchange> <symbol> <side> <size> [leverage]  - 开仓
   /closeposition <position_id> [price]  - 平仓
+  /positions  - 查看所有交易者的仓位 (按 trader 分组)
   /help  - 显示帮助
   /quit 或 /exit  - 退出程序
 
@@ -179,6 +182,42 @@ class CryptoBot:
 
   注意: 新的交易者将以文件夹形式创建，如: traders/TraderName_ID/profile.md
 
+[bold yellow]/newindicator <prompt>[/bold yellow]
+  使用 Claude Code AI 生成新的指标脚本
+  参数说明:
+    prompt  - 指标描述（必填）
+
+  示例:
+    /newindicator 获取资金费率历史数据              # 生成资金费率指标
+    /newindicator 计算移动平均线收敛散度           # 生成 MACD 指标
+    /newindicator 获取多交易所价格对比数据          # 生成价格对比指标
+
+  流程:
+    1. 进入 indicators/ 目录
+    2. 阅读 INDICATORS.md 了解编写规则
+    3. 根据提示词生成指标脚本
+    4. 自动运行测试
+    5. 测试通过后清除测试文件
+
+[bold yellow]/indicators [filename] [-d] [-m <prompt>][/bold yellow]
+  查看所有指标脚本、删除脚本或修改脚本
+  参数说明:
+    filename  - 脚本文件名（可选）
+    -d        - 删除标志（需要配合 filename 使用）
+    -m        - 修改标志（需要配合 filename 和 prompt 使用）
+    prompt    - 修改提示词（当提供 filename 和 -m 时修改脚本）
+
+  示例:
+    /indicators                        # 列出所有指标脚本
+    /indicators fetch_orderbook.py     # 查看指定脚本的详细信息
+    /indicators fetch_orderbook.py -d  # 删除指定脚本
+    /indicators market_data.py -m 增加MACD指标  # 修改脚本，添加MACD指标
+
+  流程:
+    - 删除时会同时删除文件和记录
+    - 修改会调用 Claude Code 在 indicators/ 目录下进行修改
+    - 修改完成后会自动测试并清除测试文件
+
 [bold yellow]/decide <trader_id>[/bold yellow]
   AI 自动交易决策
   参数说明:
@@ -194,6 +233,13 @@ class CryptoBot:
     4. AI 基于完整数据做出决策并执行
 
   可能的决策: 开仓 (OPEN_LONG/OPEN_SHORT)、平仓 (CLOSE_POSITION)、清仓 (CLOSE_ALL)、持有 (HOLD)
+
+[bold yellow]/positions[/bold yellow]
+  查看所有交易者的仓位信息，按 trader 分组显示
+  自动获取最新价格并更新未实现盈亏
+
+  示例:
+    /positions    # 查看所有交易者的仓位
 
 [bold yellow]/help[/bold yellow]
   显示此帮助信息
@@ -1328,6 +1374,432 @@ Important:
             import traceback
             self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
 
+    async def _handle_newindicator_command(self, args: list):
+        """Handle the /newindicator command
+
+        Generates a new indicator script using Claude Code as a subprocess.
+
+        Args:
+            args: Command arguments (prompt for indicator generation)
+        """
+
+        # Check if prompt is provided
+        if not args:
+            self.console.print("[red]错误: 请提供指标描述提示词[/red]")
+            self.console.print("[yellow]示例: /newindicator 获取资金费率历史数据[/yellow]")
+            return
+
+        # Check if INDICATORS.md exists
+        project_root = Path(__file__).parent.parent
+        indicators_dir = project_root / "indicators"
+        indicators_guide = indicators_dir / "INDICATORS.md"
+
+        if not indicators_guide.exists():
+            self.console.print(
+                f"[red]错误: 找不到 {indicators_guide}[/red]"
+            )
+            self.console.print(
+                "[yellow]请确保 INDICATORS.md 文件存在于 indicators/ 目录中[/yellow]"
+            )
+            return
+
+        # Find Claude Code executable
+        claude_path = shutil.which("claude")
+        if not claude_path:
+            self.console.print(
+                "[red]错误: 未找到 Claude Code 可执行文件[/red]"
+            )
+            self.console.print(
+                "[yellow]请访问 https://code.claude.com 安装 Claude Code[/yellow]"
+            )
+            return
+
+        # Prepare user prompt
+        user_prompt = " ".join(args)
+
+        # Get list of existing Python files BEFORE running Claude Code
+        py_files_before = set(f.name for f in indicators_dir.glob("*.py") if f.name != "__init__.py")
+        test_files_before = set(f.name for f in indicators_dir.glob("*test*.py"))
+
+        # Prepare instructions for Claude Code
+        instructions = f"""Read the file INDICATORS.md for complete instructions on writing indicator scripts.
+
+Your task: {user_prompt}
+
+Important requirements:
+1. Follow the template in INDICATORS.md exactly
+2. Output must be in CSV format
+3. Include proper error handling (return CSV with 'error' column if failed)
+4. Use argparse for command-line arguments
+5. Add proper docstrings
+6. Create a new Python file in the indicators/ directory
+
+After writing the script, run a test to verify it works correctly.
+Test by executing the script with sample parameters.
+
+If test files are created during testing, clean them up after tests pass.
+Only create ONE new indicator script."""
+
+        self.console.print("[cyan]正在调用 Claude Code 生成新的指标脚本...[/cyan]")
+        self.console.print(f"[dim]提示: {user_prompt}[/dim]\n")
+
+        try:
+            # Run Claude Code as subprocess with real-time output
+            self.console.print("[dim]Claude Code 正在处理任务...[/dim]\n")
+
+            # Use Popen for real-time output streaming
+            process = subprocess.Popen(
+                [claude_path, "--print", instructions],
+                cwd=str(indicators_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1  # Line buffered
+            )
+
+            # Stream output in real-time
+            output_lines = []
+            try:
+                for line in process.stdout:
+                    output_lines.append(line)
+                    # Show output in dim color to avoid cluttering
+                    self.console.print(f"[dim]{line.rstrip()}[/dim]", end="\n")
+            except Exception as e:
+                process.kill()
+                raise e
+
+            # Wait for process to complete with timeout
+            try:
+                return_code = process.wait(timeout=300)  # 5 minute timeout
+            except subprocess.TimeoutExpired:
+                process.kill()
+                self.console.print("[red]错误: Claude Code 执行超时（5分钟）[/red]")
+                return
+
+            result = type('obj', (object,), {
+                'stdout': ''.join(output_lines),
+                'stderr': '',
+                'returncode': return_code
+            })()
+
+            # Get list of Python files AFTER running Claude Code
+            py_files_after = set(f.name for f in indicators_dir.glob("*.py") if f.name != "__init__.py")
+
+            # Find new files
+            new_files = py_files_after - py_files_before
+
+            if not new_files:
+                self.console.print("[yellow]未检测到新创建的指标脚本[/yellow]")
+                self.console.print(f"[dim]Claude Code 输出:\n{result.stdout}[/dim]")
+                if result.stderr:
+                    self.console.print(f"[dim]错误:\n{result.stderr}[/dim]")
+                return
+
+            # Check for test files and clean them up
+            test_files_after = set(f.name for f in indicators_dir.glob("*test*.py"))
+            new_test_files = test_files_after - test_files_before
+
+            # Clean up test files
+            for test_file in new_test_files:
+                test_path = indicators_dir / test_file
+                try:
+                    test_path.unlink()
+                    self.console.print(f"[dim]已清除测试文件: {test_file}[/dim]")
+                except Exception as e:
+                    self.console.print(f"[yellow]警告: 无法删除测试文件 {test_file}: {e}[/yellow]")
+
+            # Report success
+            self.console.print(f"\n[green]成功! 已创建 {len(new_files)} 个新指标脚本[/green]")
+            for script_file in new_files:
+                self.console.print(f"  [cyan]• {script_file}[/cyan]")
+
+            # Show Claude output if there were issues
+            if result.returncode != 0:
+                self.console.print(f"\n[dim]Claude Code 退出码: {result.returncode}[/dim]")
+
+        except Exception as e:
+            self.console.print(f"[red]错误: {e}[/red]")
+            import traceback
+            self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
+
+    async def _handle_indicators_command(self, args: list):
+        """Handle the /indicators command
+
+        Lists, deletes, or modifies indicator scripts in the indicators/ directory.
+
+        Args:
+            args: Command arguments (filename [-d] [-m <prompt>])
+        """
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.syntax import Syntax
+
+        # Check if INDICATORS.md exists
+        project_root = Path(__file__).parent.parent
+        indicators_dir = project_root / "indicators"
+
+        if not indicators_dir.exists():
+            self.console.print(
+                f"[red]错误: 找不到 {indicators_dir}[/red]"
+            )
+            return
+
+        # Parse arguments
+        filename = None
+        delete_mode = False
+        modify_mode = False
+        modify_prompt = None
+
+        if args:
+            filename = args[0]
+            # Check for flags
+            if "-d" in args[1:]:
+                delete_mode = True
+            if "-m" in args[1:]:
+                modify_mode = True
+                try:
+                    m_index = args.index("-m")
+                    modify_prompt = " ".join(args[m_index + 1:]) if m_index + 1 < len(args) else None
+                except ValueError:
+                    modify_prompt = None
+
+        # DELETE MODE
+        if delete_mode and filename:
+            if not filename.endswith('.py'):
+                self.console.print("[red]错误: 文件名必须以 .py 结尾[/red]")
+                return
+
+            script_path = indicators_dir / filename
+
+            if not script_path.exists():
+                self.console.print(f"[red]错误: 找不到文件 {filename}[/red]")
+                return
+
+            # Prevent deletion of base.py
+            if filename == "base.py":
+                self.console.print("[red]错误: 不能删除 base.py 文件[/red]")
+                return
+
+            # Confirm deletion
+            self.console.print(f"[yellow]确认删除脚本: {filename} ?[/yellow]")
+            self.console.print("[dim]此操作不可恢复[/dim]")
+
+            try:
+                script_path.unlink()
+                self.console.print(f"[green]✓ 已删除 {filename}[/green]")
+            except Exception as e:
+                self.console.print(f"[red]删除失败: {e}[/red]")
+            return
+
+        # MODIFY MODE
+        if modify_mode and filename:
+            if not modify_prompt:
+                self.console.print("[red]错误: 请提供修改提示词[/red]")
+                self.console.print("[yellow]示例: /indicators market_data.py -m 增加MACD指标[/yellow]")
+                return
+
+            if not filename.endswith('.py'):
+                self.console.print("[red]错误: 文件名必须以 .py 结尾[/red]")
+                return
+
+            script_path = indicators_dir / filename
+
+            if not script_path.exists():
+                self.console.print(f"[red]错误: 找不到文件 {filename}[/red]")
+                return
+
+            # Find Claude Code executable
+            claude_path = shutil.which("claude")
+            if not claude_path:
+                self.console.print(
+                    "[red]错误: 未找到 Claude Code 可执行文件[/red]"
+                )
+                self.console.print(
+                    "[yellow]请访问 https://code.claude.com 安装 Claude Code[/yellow]"
+                )
+                return
+
+            # Get file modification time before
+            mtime_before = script_path.stat().st_mtime
+
+            # Prepare instructions for Claude Code
+            instructions = f"""Read the file INDICATORS.md for complete instructions on writing indicator scripts.
+
+Your task: Modify the file {filename} according to the following request:
+{modify_prompt}
+
+Important requirements:
+1. Follow the template in INDICATORS.md exactly
+2. Maintain CSV output format
+3. Keep existing functionality unless asked to change it
+4. Preserve proper error handling
+5. Add proper docstrings for any new code
+
+After modifying the script, run a test to verify it works correctly.
+Test by executing the script with sample parameters.
+
+If test files are created during testing, clean them up after tests pass."""
+
+            self.console.print("[cyan]正在调用 Claude Code 修改指标脚本...[/cyan]")
+            self.console.print(f"[dim]文件: {filename}[/dim]")
+            self.console.print(f"[dim]修改: {modify_prompt}[/dim]\n")
+
+            try:
+                # Run Claude Code as subprocess with real-time output
+                self.console.print("[dim]Claude Code 正在处理任务...[/dim]\n")
+
+                # Use Popen for real-time output streaming
+                process = subprocess.Popen(
+                    [claude_path, "--print", instructions],
+                    cwd=str(indicators_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1  # Line buffered
+                )
+
+                # Stream output in real-time
+                output_lines = []
+                try:
+                    for line in process.stdout:
+                        output_lines.append(line)
+                        # Show output in dim color to avoid cluttering
+                        self.console.print(f"[dim]{line.rstrip()}[/dim]", end="\n")
+                except Exception as e:
+                    process.kill()
+                    raise e
+
+                # Wait for process to complete with timeout
+                try:
+                    return_code = process.wait(timeout=300)  # 5 minute timeout
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    self.console.print("[red]错误: Claude Code 执行超时（5分钟）[/red]")
+                    return
+
+                # Check if file was modified
+                mtime_after = script_path.stat().st_mtime
+                if mtime_after > mtime_before:
+                    self.console.print(f"\n[green]✓ {filename} 已成功修改[/green]")
+                else:
+                    self.console.print(f"[yellow]警告: 未检测到文件修改[/yellow]")
+
+                # Check for test files and clean them up
+                test_files = list(indicators_dir.glob("*test*.py"))
+                for test_file in test_files:
+                    try:
+                        test_file.unlink()
+                        self.console.print(f"[dim]已清除测试文件: {test_file.name}[/dim]")
+                    except Exception as e:
+                        self.console.print(f"[yellow]警告: 无法删除测试文件 {test_file.name}: {e}[/yellow]")
+
+            except Exception as e:
+                self.console.print(f"[red]错误: {e}[/red]")
+                import traceback
+                self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            return
+
+        # VIEW SINGLE FILE MODE
+        if filename:
+            if not filename.endswith('.py'):
+                self.console.print("[red]错误: 文件名必须以 .py 结尾[/red]")
+                return
+
+            script_path = indicators_dir / filename
+
+            if not script_path.exists():
+                self.console.print(f"[red]错误: 找不到文件 {filename}[/red]")
+                return
+
+            # Read and display file content
+            try:
+                content = script_path.read_text(encoding='utf-8')
+
+                # Display with syntax highlighting
+                syntax = Syntax(content, "python", theme="monokai", line_numbers=True)
+                panel = Panel(syntax, title=f"[bold cyan]{filename}[/bold cyan]", border_style="cyan")
+                self.console.print("\n", panel)
+
+            except Exception as e:
+                self.console.print(f"[red]读取文件错误: {e}[/red]")
+            return
+
+        # LIST ALL MODE (default)
+        py_files = [f for f in indicators_dir.glob("*.py") if f.name != "__init__.py"]
+
+        if not py_files:
+            self.console.print("[yellow]未找到指标脚本[/yellow]")
+            return
+
+        # Create table for display
+        table = Table(title="[bold cyan]指标脚本列表[/bold cyan]", show_header=True, header_style="bold magenta")
+        table.add_column("文件名", style="cyan", width=30)
+        table.add_column("描述", style="white")
+
+        # Read each file to extract docstring
+        for script_file in sorted(py_files):
+            try:
+                content = script_file.read_text(encoding='utf-8')
+
+                # Extract docstring (first multiline string after file start)
+                docstring = ""
+                lines = content.split('\n')
+
+                # Look for docstring pattern
+                in_docstring = False
+                docstring_lines = []
+
+                for i, line in enumerate(lines):
+                    stripped = line.strip()
+
+                    # Look for opening triple quotes
+                    if '"""' in stripped or "'''" in stripped:
+                        if not in_docstring:
+                            in_docstring = True
+                            # Remove the quotes and add content
+                            quote_start = stripped.find('"""') if '"""' in stripped else stripped.find("'''")
+                            content_part = stripped[quote_start + 3:].strip()
+                            if content_part:  # Content on same line
+                                docstring_lines.append(content_part)
+                            # Check if closing on same line
+                            if stripped.count('"""') >= 2 or stripped.count("'''") >= 2:
+                                in_docstring = False
+                                break
+                        else:
+                            # Closing quotes
+                            in_docstring = False
+                            break
+                    elif in_docstring:
+                        docstring_lines.append(stripped)
+
+                    # Stop if we've gone too far (not in docstring anymore)
+                    if not in_docstring and len(docstring_lines) > 0:
+                        break
+
+                if docstring_lines:
+                    # Join and clean up
+                    docstring = ' '.join(docstring_lines)
+                    # Limit length
+                    if len(docstring) > 100:
+                        docstring = docstring[:97] + "..."
+                else:
+                    docstring = "[dim]无描述[/dim]"
+
+                table.add_row(script_file.name, docstring)
+
+            except Exception as e:
+                table.add_row(script_file.name, f"[red]读取错误: {e}[/red]")
+
+        self.console.print("\n")
+        self.console.print(table)
+
+        # Show usage hint
+        self.console.print("\n[dim]提示:[/dim]")
+        self.console.print("[dim]  /newindicator <描述> 创建新的指标脚本[/dim]")
+        self.console.print("[dim]  /indicators <文件名> 查看脚本详情[/dim]")
+        self.console.print("[dim]  /indicators <文件名> -d 删除脚本[/dim]")
+        self.console.print("[dim]  /indicators <文件名> -m <提示> 修改脚本[/dim]")
+
     async def _handle_decide_command(self, args: list):
         """Handle the /decide command - AI-driven trading decision
 
@@ -2264,6 +2736,184 @@ Your decision (ONE LINE ONLY):"""
         finally:
             pos_db.close()
 
+    async def _handle_positions_command(self, args: list):
+        """处理 /positions 命令
+
+        显示所有交易者的仓位，按 trader 分组显示，并显示仓位的最新数据
+
+        Args:
+            args: 命令参数（暂无参数）
+        """
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.text import Text as RichText
+        from rich.columns import Columns
+
+        # Initialize databases
+        trader_db = TraderDatabase()
+        trader_db.initialize()
+
+        pos_db = PositionDatabase()
+        pos_db.initialize()
+
+        try:
+            # Get all traders
+            traders = trader_db.list_traders()
+
+            if not traders:
+                self.console.print("[yellow]暂无交易者档案[/yellow]")
+                self.console.print("[dim]使用 /newtrader 命令创建新的交易者档案[/dim]")
+                return
+
+            # Fetch current prices and update all positions
+            self.console.print("[cyan]正在获取所有交易者的仓位信息...[/cyan]")
+            price_service = get_price_service()
+
+            # Update positions for all traders
+            for trader in traders:
+                try:
+                    await price_service.update_trader_positions(trader['id'], pos_db)
+                except Exception as e:
+                    self.console.print(f"[dim]警告: 更新 {trader['id']} 仓位时出错: {e}[/dim]")
+
+            # Collect positions by trader
+            traders_with_positions = []
+
+            for trader in traders:
+                trader_id = trader['id']
+                positions = pos_db.list_positions(trader_id)
+
+                if positions:
+                    # Get summary
+                    summary = pos_db.get_trader_positions_summary(trader_id)
+
+                    traders_with_positions.append({
+                        'trader': trader,
+                        'positions': positions,
+                        'summary': summary
+                    })
+
+            if not traders_with_positions:
+                self.console.print("[yellow]暂无仓位记录[/yellow]")
+                return
+
+            # Display each trader's positions
+            for item in traders_with_positions:
+                trader = item['trader']
+                positions = item['positions']
+                summary = item['summary']
+
+                # Create positions table for this trader
+                table = Table(
+                    title=f"[bold cyan]交易者 {trader['id']} 的仓位[/bold cyan]",
+                    show_header=True,
+                    header_style="bold magenta"
+                )
+                table.add_column("ID", style="cyan", width=6)
+                table.add_column("交易所", style="green", width=10)
+                table.add_column("交易对", style="white", width=12)
+                table.add_column("方向", style="yellow", width=6)
+                table.add_column("杠杆", style="magenta", width=6)
+                table.add_column("入场价", style="white", width=12)
+                table.add_column("数量", style="white", width=10)
+                table.add_column("保证金", style="white", width=10)
+                table.add_column("盈亏", style="white", width=12)
+                table.add_column("ROI %", style="white", width=10)
+                table.add_column("状态", style="white", width=10)
+
+                # Sort by PnL
+                sorted_positions = sorted(
+                    positions,
+                    key=lambda p: p.unrealized_pnl if p.status == PositionStatus.OPEN else p.realized_pnl,
+                    reverse=True
+                )
+
+                for pos in sorted_positions:
+                    pnl = pos.unrealized_pnl if pos.status == PositionStatus.OPEN else pos.realized_pnl
+                    pnl_color = "green" if pnl > 0 else "red" if pnl < 0 else "white"
+                    pnl_str = f"[{pnl_color}]{pnl:+.2f}[/{pnl_color}]"
+
+                    roi_color = "green" if pos.roi > 0 else "red" if pos.roi < 0 else "white"
+                    roi_str = f"[{roi_color}]{pos.roi:+.2f}%[/{roi_color}]"
+
+                    status_str = pos.status.value
+                    status_color = "green" if pos.status == PositionStatus.OPEN else "yellow"
+
+                    table.add_row(
+                        str(pos.id),
+                        pos.exchange,
+                        pos.symbol,
+                        pos.position_side.value,
+                        f"{pos.leverage:.1f}x",
+                        f"{pos.entry_price:.2f}",
+                        f"{pos.position_size:.4f}",
+                        f"{pos.margin:.2f}",
+                        pnl_str,
+                        roi_str,
+                        f"[{status_color}]{status_str}[/{status_color}]"
+                    )
+
+                self.console.print("\n", table)
+
+                # Display summary for this trader
+                summary_text = RichText()
+                summary_text.append(f"总仓位: {summary['total_positions']}\n", style="white")
+                summary_text.append(f"持仓中: {summary['open_positions']}\n", style="green")
+                summary_text.append(f"已平仓: {summary['closed_positions']}\n", style="yellow")
+                summary_text.append(f"已清算: {summary['liquidated_positions']}\n", style="red")
+                summary_text.append(f"\n未实现盈亏: ", style="white")
+                summary_text.append(f"{summary['total_unrealized_pnl']:+.2f} USDT\n",
+                                 style="green" if summary['total_unrealized_pnl'] > 0 else "red")
+                summary_text.append(f"已实现盈亏: ", style="white")
+                summary_text.append(f"{summary['total_realized_pnl']:+.2f} USDT\n",
+                                 style="green" if summary['total_realized_pnl'] > 0 else "red")
+                summary_text.append(f"平均 ROI: ", style="white")
+                summary_text.append(f"{summary['average_roi']:+.2f}%",
+                                 style="green" if summary['average_roi'] > 0 else "red")
+                summary_text.append(f"\n\n余额: ", style="white")
+                summary_text.append(f"{trader.get('current_balance', 0):.2f} USDT",
+                                 style="cyan")
+                summary_text.append(f"\n权益: ", style="white")
+                equity = trader.get('equity', 0)
+                balance = trader.get('current_balance', 0)
+                equity_color = "green" if equity > balance else "red" if equity < balance else "white"
+                summary_text.append(f"{equity:.2f} USDT", style=equity_color)
+
+                panel = Panel(summary_text, title="[bold cyan]仓位统计[/bold cyan]", border_style="cyan")
+                self.console.print("\n", panel)
+
+            # Display overall summary
+            total_positions = sum(item['summary']['total_positions'] for item in traders_with_positions)
+            total_open = sum(item['summary']['open_positions'] for item in traders_with_positions)
+            total_closed = sum(item['summary']['closed_positions'] for item in traders_with_positions)
+            total_liquidated = sum(item['summary']['liquidated_positions'] for item in traders_with_positions)
+            total_unrealized_pnl = sum(item['summary']['total_unrealized_pnl'] for item in traders_with_positions)
+            total_realized_pnl = sum(item['summary']['total_realized_pnl'] for item in traders_with_positions)
+
+            overall_text = RichText()
+            overall_text.append(f"交易者总数: {len(traders)}\n", style="cyan")
+            overall_text.append(f"总仓位数: {total_positions}\n", style="white")
+            overall_text.append(f"持仓中: {total_open}\n", style="green")
+            overall_text.append(f"已平仓: {total_closed}\n", style="yellow")
+            overall_text.append(f"已清算: {total_liquidated}\n", style="red")
+            overall_text.append(f"\n总未实现盈亏: ", style="white")
+            overall_text.append(f"{total_unrealized_pnl:+.2f} USDT\n",
+                             style="green" if total_unrealized_pnl > 0 else "red")
+            overall_text.append(f"总已实现盈亏: ", style="white")
+            overall_text.append(f"{total_realized_pnl:+.2f} USDT\n",
+                             style="green" if total_realized_pnl > 0 else "red")
+
+            overall_panel = Panel(overall_text, title="[bold yellow]总体统计[/bold yellow]", border_style="yellow")
+            self.console.print("\n", overall_panel)
+
+        except Exception as e:
+            self.console.print(f"[red]错误: {e}[/red]")
+            import traceback
+            self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        finally:
+            pos_db.close()
+            trader_db.close()
+
     async def run(self):
         """运行 CLI 主循环"""
         self._print_banner()
@@ -2303,6 +2953,12 @@ Your decision (ONE LINE ONLY):"""
                 elif command == "/newtrader":
                     await self._handle_newtrader_command(args)
 
+                elif command == "/newindicator":
+                    await self._handle_newindicator_command(args)
+
+                elif command == "/indicators":
+                    await self._handle_indicators_command(args)
+
                 elif command == "/decide":
                     await self._handle_decide_command(args)
 
@@ -2311,6 +2967,9 @@ Your decision (ONE LINE ONLY):"""
 
                 elif command == "/closeposition":
                     await self._handle_closeposition_command(args)
+
+                elif command == "/positions":
+                    await self._handle_positions_command(args)
 
                 else:
                     self.console.print(
