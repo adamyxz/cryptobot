@@ -1,0 +1,11 @@
+[project]
+name = "cryptobot"
+version = "0.1.0"
+description = "K线数据订阅 CLI 工具"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "prompt-toolkit>=3.0.47",
+    "rich>=13.7.1",
+    "ccxt>=4.0.0",
+]
