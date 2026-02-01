@@ -280,11 +280,15 @@ class PositionDatabase:
             exit_fee = calculate_fee(position.exchange, position.position_size, exit_price)
 
         # Calculate realized PnL
+        # Note: Leverage affects margin requirement but NOT the PnL calculation
+        # If you open a 1 BTC position with 10x leverage:
+        # - You control 1 BTC worth of position
+        # - Price change of 1 USDT = 1 USDT PnL change (not 10 USDT)
         price_diff = exit_price - position.entry_price
         if position.position_side == PositionSide.LONG:
-            pnl = position.position_size * price_diff * position.leverage
+            pnl = position.position_size * price_diff
         else:
-            pnl = position.position_size * (-price_diff) * position.leverage
+            pnl = position.position_size * (-price_diff)
 
         realized_pnl = pnl - position.entry_fee - exit_fee
 

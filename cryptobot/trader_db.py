@@ -83,6 +83,14 @@ class TraderDatabase:
             CREATE INDEX IF NOT EXISTS idx_created_at ON traders(created_at)
         """)
 
+        # Create new relational tables
+        self._create_pairs_table(cursor)
+        self._create_intervals_table(cursor)
+        self._create_junction_tables(cursor)
+
+        # Populate default intervals
+        self._populate_default_intervals(cursor)
+
         self.conn.commit()
 
     def close(self):
@@ -127,6 +135,10 @@ class TraderDatabase:
         if not self.conn:
             self.initialize()
 
+        # Extract pairs and intervals for relational storage
+        trading_pairs = trader_data.pop('trading_pairs', [])
+        timeframes = trader_data.pop('timeframes', [])
+
         cursor = self.conn.cursor()
 
         try:
@@ -142,8 +154,8 @@ class TraderDatabase:
                 json.dumps(trader_data.get('characteristics', {})),
                 trader_data.get('style', ''),
                 json.dumps(trader_data.get('strategy', {})),
-                json.dumps(trader_data.get('trading_pairs', [])),
-                json.dumps(trader_data.get('timeframes', [])),
+                json.dumps([]),  # Empty array for deprecated field
+                json.dumps([]),  # Empty array for deprecated field
                 json.dumps(trader_data.get('indicators', [])),
                 json.dumps(trader_data.get('information_sources', [])),
                 trader_data.get('prompt', ''),
@@ -153,6 +165,14 @@ class TraderDatabase:
                 trader_data.get('current_balance', 10000.0),
                 trader_data.get('equity', 10000.0)
             ))
+
+            # Create relational associations
+            trader_id = trader_data['id']
+            if trading_pairs:
+                self.add_trader_pairs(trader_id, trading_pairs)
+            if timeframes:
+                self.add_trader_intervals(trader_id, timeframes)
+
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -251,10 +271,10 @@ class TraderDatabase:
             Dictionary with parsed JSON fields
         """
         trader_dict = dict(row)
+        trader_id = trader_dict['id']
 
-        # Parse JSON fields
-        for field in ['characteristics', 'strategy', 'trading_pairs', 'timeframes',
-                      'indicators', 'information_sources', 'metadata']:
+        # Parse JSON fields (except trading_pairs, timeframes - fetched from relations)
+        for field in ['characteristics', 'strategy', 'indicators', 'information_sources', 'metadata']:
             if trader_dict.get(field):
                 try:
                     trader_dict[field] = json.loads(trader_dict[field])
@@ -262,6 +282,16 @@ class TraderDatabase:
                     trader_dict[field] = {}
             else:
                 trader_dict[field] = {} if field in ['characteristics', 'strategy', 'metadata'] else []
+
+        # Fetch trading_pairs from relational table
+        trader_dict['trading_pairs'] = [
+            p['symbol'] for p in self.get_trader_pairs(trader_id)
+        ]
+
+        # Fetch timeframes from relational table
+        trader_dict['timeframes'] = [
+            i['code'] for i in self.get_trader_intervals(trader_id)
+        ]
 
         return trader_dict
 
@@ -494,3 +524,263 @@ class TraderDatabase:
 
         self.conn.commit()
         return cursor.rowcount > 0
+
+    # =============================================================================
+    # Pairs and Intervals Relational Tables
+    # =============================================================================
+
+    def _create_pairs_table(self, cursor):
+        """Create pairs table"""
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL UNIQUE,
+                exchange TEXT NOT NULL,
+                base_currency TEXT,
+                quote_currency TEXT,
+                contract_type TEXT DEFAULT 'perpetual',
+                is_active BOOLEAN DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pairs_symbol ON pairs(symbol)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pairs_exchange ON pairs(exchange)")
+
+    def _create_intervals_table(self, cursor):
+        """Create intervals table"""
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS intervals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                seconds INTEGER NOT NULL,
+                category TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_intervals_code ON intervals(code)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_intervals_seconds ON intervals(seconds)")
+
+    def _create_junction_tables(self, cursor):
+        """Create many-to-many junction tables"""
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trader_pairs (
+                trader_id TEXT NOT NULL,
+                pair_id INTEGER NOT NULL,
+                is_primary BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (trader_id, pair_id),
+                FOREIGN KEY (trader_id) REFERENCES traders(id) ON DELETE CASCADE,
+                FOREIGN KEY (pair_id) REFERENCES pairs(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tp_trader ON trader_pairs(trader_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tp_pair ON trader_pairs(pair_id)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trader_intervals (
+                trader_id TEXT NOT NULL,
+                interval_id INTEGER NOT NULL,
+                purpose TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (trader_id, interval_id),
+                FOREIGN KEY (trader_id) REFERENCES traders(id) ON DELETE CASCADE,
+                FOREIGN KEY (interval_id) REFERENCES intervals(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ti_trader ON trader_intervals(trader_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ti_interval ON trader_intervals(interval_id)")
+
+    def _populate_default_intervals(self, cursor):
+        """Populate intervals table with default values"""
+        intervals = [
+            ('1m', '1 minute', 60, 'minute'),
+            ('3m', '3 minutes', 180, 'minute'),
+            ('5m', '5 minutes', 300, 'minute'),
+            ('15m', '15 minutes', 900, 'minute'),
+            ('30m', '30 minutes', 1800, 'minute'),
+            ('1h', '1 hour', 3600, 'hour'),
+            ('2h', '2 hours', 7200, 'hour'),
+            ('4h', '4 hours', 14400, 'hour'),
+            ('6h', '6 hours', 21600, 'hour'),
+            ('12h', '12 hours', 43200, 'hour'),
+            ('1d', '1 day', 86400, 'day'),
+            ('1w', '1 week', 604800, 'week'),
+            ('1M', '1 month', 2592000, 'month'),
+        ]
+
+        cursor.executemany(
+            "INSERT OR IGNORE INTO intervals (code, name, seconds, category) VALUES (?, ?, ?, ?)",
+            intervals
+        )
+
+    def sync_pairs_from_exchange(self, exchange: str, markets: list) -> int:
+        """Sync pairs from CCXT exchange data
+
+        Args:
+            exchange: Exchange name (e.g., 'binance')
+            markets: List of market dicts from CCXT
+
+        Returns:
+            Number of pairs synced
+        """
+        if not self.conn:
+            self.initialize()
+
+        cursor = self.conn.cursor()
+        synced = 0
+
+        for market in markets:
+            symbol = market['symbol']
+            # Normalize symbol (remove CCXT formatting)
+            normalized = symbol.replace('/', '').replace(':', '').replace('-', '')
+
+            try:
+                cursor.execute("""
+                    INSERT INTO pairs (symbol, exchange, base_currency, quote_currency)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    normalized,
+                    exchange,
+                    market.get('base'),
+                    market.get('quote') or 'USDT'
+                ))
+                synced += 1
+            except sqlite3.IntegrityError:
+                # Pair exists, update it
+                cursor.execute("""
+                    UPDATE pairs
+                    SET exchange = ?, base_currency = ?, quote_currency = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE symbol = ?
+                """, (exchange, market.get('base'), market.get('quote') or 'USDT', normalized))
+                synced += 1
+
+        self.conn.commit()
+        return synced
+
+    def get_pair_by_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get pair by symbol"""
+        if not self.conn:
+            self.initialize()
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM pairs WHERE symbol = ?", (symbol,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_all_pairs(self, exchange: str = None) -> List[Dict[str, Any]]:
+        """Get all pairs, optionally filtered by exchange"""
+        if not self.conn:
+            self.initialize()
+
+        cursor = self.conn.cursor()
+        if exchange:
+            cursor.execute("SELECT * FROM pairs WHERE exchange = ? ORDER BY symbol", (exchange,))
+        else:
+            cursor.execute("SELECT * FROM pairs ORDER BY symbol")
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_intervals(self) -> List[Dict[str, Any]]:
+        """Get all intervals ordered by seconds"""
+        if not self.conn:
+            self.initialize()
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM intervals ORDER BY seconds")
+        return [dict(row) for row in cursor.fetchall()]
+
+    def add_trader_pairs(self, trader_id: str, pair_symbols: List[str], exchange: str = 'binance'):
+        """Associate pairs with a trader
+
+        Args:
+            trader_id: Trader ID
+            pair_symbols: List of pair symbols (e.g., ['BTCUSDT', 'ETHUSDT'])
+            exchange: Exchange name (default: 'binance')
+        """
+        if not self.conn:
+            self.initialize()
+
+        cursor = self.conn.cursor()
+
+        for symbol in pair_symbols:
+            # Get or create pair
+            pair = self.get_pair_by_symbol(symbol)
+            if not pair:
+                cursor.execute("""
+                    INSERT INTO pairs (symbol, exchange)
+                    VALUES (?, ?)
+                """, (symbol, exchange))
+                pair_id = cursor.lastrowid
+            else:
+                pair_id = pair['id']
+
+            # Create association
+            try:
+                cursor.execute("""
+                    INSERT INTO trader_pairs (trader_id, pair_id)
+                    VALUES (?, ?)
+                """, (trader_id, pair_id))
+            except sqlite3.IntegrityError:
+                pass  # Already exists
+
+        self.conn.commit()
+
+    def add_trader_intervals(self, trader_id: str, interval_codes: List[str]):
+        """Associate intervals with a trader
+
+        Args:
+            trader_id: Trader ID
+            interval_codes: List of interval codes (e.g., ['1h', '4h', '1d'])
+        """
+        if not self.conn:
+            self.initialize()
+
+        cursor = self.conn.cursor()
+
+        for code in interval_codes:
+            # Get interval
+            cursor.execute("SELECT id FROM intervals WHERE code = ?", (code,))
+            row = cursor.fetchone()
+
+            if row:
+                interval_id = row['id']
+                try:
+                    cursor.execute("""
+                        INSERT INTO trader_intervals (trader_id, interval_id)
+                        VALUES (?, ?)
+                    """, (trader_id, interval_id))
+                except sqlite3.IntegrityError:
+                    pass  # Already exists
+
+        self.conn.commit()
+
+    def get_trader_pairs(self, trader_id: str) -> List[Dict[str, Any]]:
+        """Get all pairs for a trader"""
+        if not self.conn:
+            self.initialize()
+
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT p.*
+            FROM pairs p
+            JOIN trader_pairs tp ON p.id = tp.pair_id
+            WHERE tp.trader_id = ?
+            ORDER BY p.symbol
+        """, (trader_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_trader_intervals(self, trader_id: str) -> List[Dict[str, Any]]:
+        """Get all intervals for a trader"""
+        if not self.conn:
+            self.initialize()
+
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT i.*
+            FROM intervals i
+            JOIN trader_intervals ti ON i.id = ti.interval_id
+            WHERE ti.trader_id = ?
+            ORDER BY i.seconds
+        """, (trader_id,))
+        return [dict(row) for row in cursor.fetchall()]

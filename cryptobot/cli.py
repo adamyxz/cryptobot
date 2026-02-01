@@ -59,6 +59,11 @@ class CryptoBot:
         self.session = PromptSession()
         self._stop_subscription = asyncio.Event()
 
+        # 初始化数据库（延迟初始化，在需要时才创建连接）
+        self.trader_db = None
+        self.pos_db = None
+        self.scheduler = None
+
     def _print_banner(self):
         """打印欢迎横幅"""
         banner = """
@@ -72,6 +77,10 @@ class CryptoBot:
 [dim]数据类型: 永续合约 (Perpetual Futures/Swap)[/dim]
 
 [bold yellow]命令:[/bold yellow]
+  /start [trader_ids]  - 启动持续运行模式 (可选指定 trader)
+  /stop  - 停止持续运行模式
+  /status  - 查看调度器状态
+  /config [key] [value]  - 查看/修改配置
   /rest [exchange] [symbol] [interval] [limit]  - 获取历史 K线 (REST)
   /pairs [exchange]  - 显示支持的交易对
   /intervals  - 显示支持的周期
@@ -83,6 +92,7 @@ class CryptoBot:
   /openposition <trader_id> <exchange> <symbol> <side> <size> [leverage]  - 开仓
   /closeposition <position_id> [price]  - 平仓
   /positions  - 查看所有交易者的仓位 (按 trader 分组)
+  /optimize <trader_id>  - AI 自我优化 (分析历史，调整策略)
   /help  - 显示帮助
   /quit 或 /exit  - 退出程序
 
@@ -171,14 +181,17 @@ class CryptoBot:
     /closeposition 1              # 使用当前市价平仓 ID 为 1 的仓位
     /closeposition 1 45000        # 以 45000 价格平仓 ID 为 1 的仓位
 
-[bold yellow]/newtrader [prompt][/bold yellow]
+[bold yellow]/newtrader [prompt] [-t <count>][/bold yellow]
   Generate a new trading strategy profile using Claude Code AI
   参数说明:
     prompt  - Optional description of desired trader
+    -t <count>  - Repeat generation <count> times (default: 1)
 
   示例:
     /newtrader                              # Generate random unique trader
     /newtrader create a conservative trader  # Generate with specific characteristics
+    /newtrader -t 3                         # Generate 3 random traders
+    /newtrader aggressive scalper -t 5      # Generate 5 aggressive scalper traders
 
   注意: 新的交易者将以文件夹形式创建，如: traders/TraderName_ID/profile.md
 
@@ -240,6 +253,21 @@ class CryptoBot:
 
   示例:
     /positions    # 查看所有交易者的仓位
+
+[bold yellow]/optimize <trader_id>[/bold yellow]
+  AI 自我优化分析 - 基于历史交易表现优化交易者策略
+  参数说明:
+    trader_id  - 交易者 ID
+
+  示例:
+    /optimize 1    # 分析交易员 1 的历史表现并优化策略
+
+  优化流程:
+    1. 收集交易者档案和历史仓位数据
+    2. 分析盈亏、胜率、风险控制等表现指标
+    3. AI 评估策略有效性，识别改进空间
+    4. 自动调整 profile.md 中的策略参数
+    5. 同步更新数据库记录
 
 [bold yellow]/help[/bold yellow]
   显示此帮助信息
@@ -470,9 +498,10 @@ class CryptoBot:
             # Create main table
             table = Table(title=f"[bold cyan]交易者档案列表[/bold cyan] (共 {len(traders)} 个)", show_header=True, header_style="bold magenta")
             table.add_column("ID", style="cyan", width=10)
-            table.add_column("交易风格", style="green", width=20)
-            table.add_column("风险偏好", style="yellow", width=12)
-            table.add_column("交易对", style="blue", width=30)
+            table.add_column("交易风格", style="green", width=18)
+            table.add_column("风险偏好", style="yellow", width=10)
+            table.add_column("交易对", style="blue", width=25)
+            table.add_column("周期", style="magenta", width=18)
             table.add_column("创建时间", style="dim", width=16)
 
             for trader in traders:
@@ -485,6 +514,12 @@ class CryptoBot:
                 pairs_str = ', '.join(pairs[:3]) if pairs else 'N/A'
                 if len(pairs) > 3:
                     pairs_str += f' (+{len(pairs) - 3})'
+
+                # Get intervals (timeframes)
+                intervals = trader.get('timeframes', [])
+                intervals_str = ', '.join(intervals[:4]) if intervals else 'N/A'
+                if len(intervals) > 4:
+                    intervals_str += f' (+{len(intervals) - 4})'
 
                 # Format style
                 style = trader.get('style', 'N/A').replace('_', ' ').title()
@@ -503,6 +538,7 @@ class CryptoBot:
                     style,
                     risk,
                     pairs_str,
+                    intervals_str,
                     created
                 )
 
@@ -826,6 +862,14 @@ Edit the profile.md file now."""
                 self.console.print("[yellow]未获取到交易对数据[/yellow]")
                 return
 
+            # Sync pairs to database
+            from cryptobot.trader_db import TraderDatabase
+            db = TraderDatabase()
+            db.initialize()
+            synced_count = db.sync_pairs_from_exchange(exchange, markets)
+            self.console.print(f"[green]已同步 {synced_count} 个交易对到数据库[/green]")
+            db.close()
+
             # 过滤活跃的 USDT 永续合约
             usdt_pairs = []
             for market in markets:
@@ -897,23 +941,14 @@ Edit the profile.md file now."""
 
     def _display_supported_intervals(self):
         """显示支持的 K线周期"""
-        intervals = [
-            ("1m", "1 分钟"),
-            ("3m", "3 分钟"),
-            ("5m", "5 分钟"),
-            ("15m", "15 分钟"),
-            ("30m", "30 分钟"),
-            ("1h", "1 小时"),
-            ("2h", "2 小时"),
-            ("4h", "4 小时"),
-            ("6h", "6 小时"),
-            ("12h", "12 小时"),
-            ("1d", "1 天"),
-            ("1w", "1 周"),
-            ("1M", "1 月"),
-        ]
-
+        from cryptobot.trader_db import TraderDatabase
         from rich.table import Table
+
+        # Read intervals from database
+        db = TraderDatabase()
+        db.initialize()
+        intervals_data = db.get_all_intervals()
+        db.close()
 
         table = Table(title="支持的 K线周期", show_header=True, header_style="bold cyan")
         table.add_column("周期代码", style="green", width=8)
@@ -922,14 +957,17 @@ Edit the profile.md file now."""
         table.add_column("说明", style="white", width=12)
 
         # 分两列显示
-        for i in range(0, len(intervals), 2):
-            if i + 1 < len(intervals):
+        for i in range(0, len(intervals_data), 2):
+            if i + 1 < len(intervals_data):
+                row1 = intervals_data[i]
+                row2 = intervals_data[i + 1]
                 table.add_row(
-                    intervals[i][0], intervals[i][1],
-                    intervals[i + 1][0], intervals[i + 1][1]
+                    row1['code'], row1['name'],
+                    row2['code'], row2['name']
                 )
             else:
-                table.add_row(intervals[i][0], intervals[i][1], "", "")
+                row1 = intervals_data[i]
+                table.add_row(row1['code'], row1['name'], "", "")
 
         self.console.print(table)
         self.console.print("\n[dim]提示: 使用 /rest <交易所> <交易对> <周期> 获取更多数据[/dim]")
@@ -1015,14 +1053,46 @@ Edit the profile.md file now."""
                 pairs_str = pairs_match.group(1).strip()
                 result['trading_pairs'].extend([p.strip() for p in pairs_str.split(',')])
 
-            # Extract Timeframes
+            # Extract Timeframes and normalize to standard codes
+            timeframe_map = {
+                '1m': '1m', '1 minute': '1m', 'minute': '1m',
+                '3m': '3m', '3 minutes': '3m',
+                '5m': '5m', '5 minutes': '5m',
+                '15m': '15m', '15 minutes': '15m',
+                '30m': '30m', '30 minutes': '30m',
+                '1h': '1h', '1 hour': '1h', 'hour': '1h', 'hourly': '1h',
+                '2h': '2h', '2 hours': '2h',
+                '4h': '4h', '4 hour': '4h', '4-hour': '4h', '4 hours': '4h',
+                '6h': '6h', '6 hours': '6h', '6-hour': '6h',
+                '12h': '12h', '12 hours': '12h', '12-hour': '12h',
+                '1d': '1d', 'daily': '1d', 'day': '1d',
+                '1w': '1w', 'weekly': '1w', 'week': '1w',
+                '1M': '1M', 'monthly': '1M', 'month': '1M',
+            }
+
+            def normalize_timeframe(text):
+                """Convert timeframe description to standard code"""
+                text_lower = text.lower()
+                for key, code in timeframe_map.items():
+                    if key.lower() in text_lower:
+                        return code
+                return None
+
             analysis_tf_match = re.search(r'- \*\*Analysis Timeframe:\*\*\s*(.+)', content)
             if analysis_tf_match:
-                result['timeframes'].append(analysis_tf_match.group(1).strip())
+                tf_text = analysis_tf_match.group(1).strip()
+                # Extract timeframes from text like "Daily (primary), Weekly (context)"
+                for part in tf_text.split(','):
+                    normalized = normalize_timeframe(part)
+                    if normalized and normalized not in result['timeframes']:
+                        result['timeframes'].append(normalized)
 
             entry_tf_match = re.search(r'- \*\*Entry Timeframe:\*\*\s*(.+)', content)
             if entry_tf_match:
-                result['timeframes'].append(entry_tf_match.group(1).strip())
+                tf_text = entry_tf_match.group(1).strip()
+                normalized = normalize_timeframe(tf_text)
+                if normalized and normalized not in result['timeframes']:
+                    result['timeframes'].append(normalized)
 
             # Extract Technical Indicators
             indicators_section = re.search(r'## Technical Indicators\n(.*?)##', content, re.DOTALL)
@@ -1071,6 +1141,14 @@ Edit the profile.md file now."""
             result['timeframes'] = list(set(result['timeframes']))
             result['indicators'] = list(set(result['indicators']))
             result['information_sources'] = list(set(result['information_sources']))
+
+            # Limit to 1-5 items for focus and specialization
+            # Take first 5 trading pairs (most important ones)
+            if len(result['trading_pairs']) > 5:
+                result['trading_pairs'] = result['trading_pairs'][:5]
+            # Take first 3 timeframes (most important ones)
+            if len(result['timeframes']) > 3:
+                result['timeframes'] = result['timeframes'][:3]
 
         except Exception as e:
             result['metadata']['parse_errors'].append(str(e))
@@ -1152,8 +1230,26 @@ Edit the profile.md file now."""
         Generates a new trader profile using Claude Code as a subprocess.
 
         Args:
-            args: Command arguments (optional prompt for trader generation)
+            args: Command arguments (optional prompt for trader generation, -t for repeat count)
         """
+
+        # Parse -t parameter (repeat count)
+        repeat_count = 1
+        prompt_args = []
+        i = 0
+        while i < len(args):
+            if args[i] == '-t' and i + 1 < len(args):
+                try:
+                    repeat_count = int(args[i + 1])
+                    if repeat_count < 1:
+                        repeat_count = 1
+                    i += 2  # Skip both -t and the number
+                except ValueError:
+                    self.console.print("[red]错误: -t 参数后必须跟一个有效的数字[/red]")
+                    return
+            else:
+                prompt_args.append(args[i])
+                i += 1
 
         # Check if TRADERS.md exists
         project_root = Path(__file__).parent.parent
@@ -1193,20 +1289,25 @@ Edit the profile.md file now."""
 
         self.console.print(f"[green]已获取 {len(top_pairs)} 个主流交易对[/green]")
 
-        # Get next numeric ID
-        db = TraderDatabase()
-        db.initialize()
-        next_id = self._get_next_trader_id(db)
-        db.close()
-
         # Prepare user prompt
-        user_prompt = " ".join(args) if args else "Generate a unique, diverse cryptocurrency trader"
+        user_prompt = " ".join(prompt_args) if prompt_args else "Generate a unique, diverse cryptocurrency trader"
 
-        # Format pairs list for instructions
-        pairs_list = "\n".join([f"  - {pair}" for pair in top_pairs[:50]])  # Top 50 pairs
+        # Loop to generate multiple traders if -t is specified
+        for iteration in range(repeat_count):
+            if repeat_count > 1:
+                self.console.print(f"\n[bold cyan]===== 生成第 {iteration + 1}/{repeat_count} 个交易者 =====[/bold cyan]\n")
 
-        # Prepare instructions for Claude Code
-        instructions = f"""Read the file TRADERS.md for complete instructions on generating traders.
+            # Fetch next numeric ID for each iteration
+            db = TraderDatabase()
+            db.initialize()
+            next_id = self._get_next_trader_id(db)
+            db.close()
+
+            # Format pairs list for instructions
+            pairs_list = "\n".join([f"  - {pair}" for pair in top_pairs[:50]])  # Top 50 pairs
+
+            # Prepare instructions for Claude Code
+            instructions = f"""Read the file TRADERS.md for complete instructions on generating traders.
 
 Then read all existing trader profile.md files to understand what traders already exist.
 They are organized in subdirectories like: traders/TraderName_ID/profile.md
@@ -1234,145 +1335,145 @@ Important:
 5. The trader must be unique and diverse from all existing traders
 6. ONLY use trading pairs from the provided list above"""
 
-        self.console.print("[cyan]正在调用 Claude Code 生成新的交易者档案...[/cyan]")
-        self.console.print(f"[dim]提示: {user_prompt}[/dim]")
-        self.console.print(f"[dim]交易员ID: {next_id}[/dim]\n")
+            self.console.print("[cyan]正在调用 Claude Code 生成新的交易者档案...[/cyan]")
+            self.console.print(f"[dim]提示: {user_prompt}[/dim]")
+            self.console.print(f"[dim]交易员ID: {next_id}[/dim]\n")
 
-        # Get list of existing trader folders BEFORE running Claude Code
-        # Check for subdirectories containing profile.md
-        trader_folders_before = set()
-        for item in traders_dir.iterdir():
-            if item.is_dir() and (item / "profile.md").exists():
-                trader_folders_before.add(item.name)
-
-        md_files_before = set(f.name for f in traders_dir.glob("*.md") if f.name != "TRADERS.md")
-
-        try:
-            # Run Claude Code as subprocess with real-time output
-            self.console.print("[dim]Claude Code 正在处理任务...[/dim]\n")
-
-            # Use Popen for real-time output streaming
-            process = subprocess.Popen(
-                [claude_path, "--print", instructions],
-                cwd=str(traders_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1  # Line buffered
-            )
-
-            # Stream output in real-time
-            output_lines = []
-            try:
-                for line in process.stdout:
-                    output_lines.append(line)
-                    # Show output in dim color to avoid cluttering
-                    self.console.print(f"[dim]{line.rstrip()}[/dim]", end="\n")
-            except Exception as e:
-                process.kill()
-                raise e
-
-            # Wait for process to complete with timeout
-            try:
-                return_code = process.wait(timeout=300)  # 5 minute timeout
-            except subprocess.TimeoutExpired:
-                process.kill()
-                self.console.print("[red]错误: Claude Code 执行超时（5分钟）[/red]")
-                return
-
-            result = type('obj', (object,), {
-                'stdout': ''.join(output_lines),
-                'stderr': '',
-                'returncode': return_code
-            })()
-
-            # Get list of trader folders AFTER running Claude Code
+            # Get list of existing trader folders BEFORE running Claude Code
             # Check for subdirectories containing profile.md
-            trader_folders_after = set()
+            trader_folders_before = set()
             for item in traders_dir.iterdir():
                 if item.is_dir() and (item / "profile.md").exists():
-                    trader_folders_after.add(item.name)
+                    trader_folders_before.add(item.name)
 
-            # Find new folders
-            new_folders = trader_folders_after - trader_folders_before
+            md_files_before = set(f.name for f in traders_dir.glob("*.md") if f.name != "TRADERS.md")
 
-            if not new_folders:
-                self.console.print("[yellow]未检测到新创建的交易者文件夹[/yellow]")
-                self.console.print(f"[dim]Claude Code 输出:\n{result.stdout}[/dim]")
-                if result.stderr:
-                    self.console.print(f"[dim]错误:\n{result.stderr}[/dim]")
-                return
+            try:
+                # Run Claude Code as subprocess with real-time output
+                self.console.print("[dim]Claude Code 正在处理任务...[/dim]\n")
 
-            # Initialize database
-            db = TraderDatabase()
-            db.initialize()
+                # Use Popen for real-time output streaming
+                process = subprocess.Popen(
+                    [claude_path, "--print", instructions],
+                    cwd=str(traders_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1  # Line buffered
+                )
 
-            new_traders_count = 0
+                # Stream output in real-time
+                output_lines = []
+                try:
+                    for line in process.stdout:
+                        output_lines.append(line)
+                        # Show output in dim color to avoid cluttering
+                        self.console.print(f"[dim]{line.rstrip()}[/dim]", end="\n")
+                except Exception as e:
+                    process.kill()
+                    raise e
 
-            # Process only new folders
-            for folder_name in new_folders:
-                trader_folder = traders_dir / folder_name
-                trader_file = trader_folder / "profile.md"
+                # Wait for process to complete with timeout
+                try:
+                    return_code = process.wait(timeout=300)  # 5 minute timeout
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    self.console.print("[red]错误: Claude Code 执行超时（5分钟）[/red]")
+                    return
 
-                # Parse the trader file
-                trader_data = self._parse_trader_file(trader_file)
+                result = type('obj', (object,), {
+                    'stdout': ''.join(output_lines),
+                    'stderr': '',
+                    'returncode': return_code
+                })()
 
-                # Prepare database record
-                trader_record = {
-                    'id': trader_data.get('id', folder_name),
-                    'trader_file': str(trader_file),
-                    'characteristics': trader_data.get('characteristics', {}),
-                    'style': trader_data.get('style', ''),
-                    'strategy': trader_data.get('strategy', {}),
-                    'trading_pairs': trader_data.get('trading_pairs', []),
-                    'timeframes': trader_data.get('timeframes', []),
-                    'indicators': trader_data.get('indicators', []),
-                    'information_sources': trader_data.get('information_sources', []),
-                    'prompt': user_prompt,
-                    'diversity_score': None,
-                    'metadata': trader_data.get('metadata', {}),
-                    'initial_balance': 10000.0,
-                    'current_balance': 10000.0,
-                    'equity': 10000.0
-                }
+                # Get list of trader folders AFTER running Claude Code
+                # Check for subdirectories containing profile.md
+                trader_folders_after = set()
+                for item in traders_dir.iterdir():
+                    if item.is_dir() and (item / "profile.md").exists():
+                        trader_folders_after.add(item.name)
 
-                # Check if trader already exists in database
-                existing = db.get_trader(trader_record['id'])
-                if existing:
+                # Find new folders
+                new_folders = trader_folders_after - trader_folders_before
+
+                if not new_folders:
+                    self.console.print("[yellow]未检测到新创建的交易者文件夹[/yellow]")
+                    self.console.print(f"[dim]Claude Code 输出:\n{result.stdout}[/dim]")
+                    if result.stderr:
+                        self.console.print(f"[dim]错误:\n{result.stderr}[/dim]")
+                    return
+
+                # Initialize database
+                db = TraderDatabase()
+                db.initialize()
+
+                new_traders_count = 0
+
+                # Process only new folders
+                for folder_name in new_folders:
+                    trader_folder = traders_dir / folder_name
+                    trader_file = trader_folder / "profile.md"
+
+                    # Parse the trader file
+                    trader_data = self._parse_trader_file(trader_file)
+
+                    # Prepare database record
+                    trader_record = {
+                        'id': trader_data.get('id', folder_name),
+                        'trader_file': str(trader_file),
+                        'characteristics': trader_data.get('characteristics', {}),
+                        'style': trader_data.get('style', ''),
+                        'strategy': trader_data.get('strategy', {}),
+                        'trading_pairs': trader_data.get('trading_pairs', []),
+                        'timeframes': trader_data.get('timeframes', []),
+                        'indicators': trader_data.get('indicators', []),
+                        'information_sources': trader_data.get('information_sources', []),
+                        'prompt': user_prompt,
+                        'diversity_score': None,
+                        'metadata': trader_data.get('metadata', {}),
+                        'initial_balance': 10000.0,
+                        'current_balance': 10000.0,
+                        'equity': 10000.0
+                    }
+
+                    # Check if trader already exists in database
+                    existing = db.get_trader(trader_record['id'])
+                    if existing:
+                        self.console.print(
+                            f"[yellow]警告: 交易者 '{trader_record['id']}' 已存在于数据库中，跳过[/yellow]"
+                        )
+                        continue
+
+                    # Add to database
+                    success = db.add_trader(trader_record)
+                    if success:
+                        new_traders_count += 1
+                        self.console.print(
+                            f"[green]✓ 交易者 '{trader_record['id']}' 已创建并记录到数据库[/green]"
+                        )
+                    else:
+                        self.console.print(
+                            f"[yellow]警告: 无法将交易者 '{trader_record['id']}' 添加到数据库[/yellow]"
+                        )
+
+                db.close()
+
+                if new_traders_count > 0:
                     self.console.print(
-                        f"[yellow]警告: 交易者 '{trader_record['id']}' 已存在于数据库中，跳过[/yellow]"
-                    )
-                    continue
-
-                # Add to database
-                success = db.add_trader(trader_record)
-                if success:
-                    new_traders_count += 1
-                    self.console.print(
-                        f"[green]✓ 交易者 '{trader_record['id']}' 已创建并记录到数据库[/green]"
+                        f"\n[green]成功! 已创建 {new_traders_count} 个新交易者档案[/green]"
                     )
                 else:
-                    self.console.print(
-                        f"[yellow]警告: 无法将交易者 '{trader_record['id']}' 添加到数据库[/yellow]"
-                    )
+                    self.console.print("[yellow]未创建新交易者[/yellow]")
 
-            db.close()
+                # Show Claude output if there were issues
+                if result.returncode != 0:
+                    self.console.print(f"\n[dim]Claude Code 退出码: {result.returncode}[/dim]")
 
-            if new_traders_count > 0:
-                self.console.print(
-                    f"\n[green]成功! 已创建 {new_traders_count} 个新交易者档案[/green]"
-                )
-            else:
-                self.console.print("[yellow]未创建新交易者[/yellow]")
-
-            # Show Claude output if there were issues
-            if result.returncode != 0:
-                self.console.print(f"\n[dim]Claude Code 退出码: {result.returncode}[/dim]")
-
-        except Exception as e:
-            self.console.print(f"[red]错误: {e}[/red]")
-            import traceback
-            self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            except Exception as e:
+                self.console.print(f"[red]错误: {e}[/red]")
+                import traceback
+                self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
 
     async def _handle_newindicator_command(self, args: list):
         """Handle the /newindicator command
@@ -1828,9 +1929,9 @@ If test files are created during testing, clean them up after tests pass."""
         wait_for_completion = '--wait' in args
 
         # Execute decision (wait for completion by default for better UX)
-        await self._execute_decision_process(trader_id)
+        await self._execute_decision_process(trader_id, verbose=True)
 
-    async def _execute_decision_process(self, trader_id: str):
+    async def _execute_decision_process(self, trader_id: str, verbose: bool = True):
         """Execute the full decision workflow
 
         Args:
@@ -1843,7 +1944,8 @@ If test files are created during testing, clean them up after tests pass."""
 
         try:
             # Phase 1: Gather data
-            self.console.print(f"[Phase 1] 收集交易员 {trader_id} 数据...")
+            if verbose:
+                self.console.print(f"[Phase 1] 收集交易员 {trader_id} 数据...")
 
             # Get trader profile
             with TraderDatabase() as db:
@@ -1877,13 +1979,15 @@ If test files are created during testing, clean them up after tests pass."""
                 open_positions = pos_db.list_positions(trader_id, status='open')
                 summary = pos_db.get_trader_positions_summary(trader_id)
             except Exception as e:
-                self.console.print(f"[警告] 无法更新价格: {e}")
+                if verbose:
+                    self.console.print(f"[警告] 无法更新价格: {e}")
 
             # Build decision context
             decision_context = self._build_decision_context(trader, open_positions, summary, profile_content)
 
             # Phase 2: AI initial assessment
-            self.console.print("[Phase 2] AI 初步分析中...")
+            if verbose:
+                self.console.print("[Phase 2] AI 初步分析中...")
             phase1_prompt = self._build_phase1_prompt(decision_context)
             phase1_response = await self._call_claude_code_for_decision(phase1_prompt, trader_id)
 
@@ -1892,23 +1996,26 @@ If test files are created during testing, clean them up after tests pass."""
                 return
 
             # Show brief summary of AI response
-            response_lines = phase1_response.strip().split('\n')
-            first_line = response_lines[0] if response_lines else phase1_response[:100]
-            self.console.print(f"[AI 响应] {first_line}")
+            if verbose:
+                response_lines = phase1_response.strip().split('\n')
+                first_line = response_lines[0] if response_lines else phase1_response[:100]
+                self.console.print(f"[AI 响应] {first_line}")
 
             # Phase 3: Execute indicators if needed
             indicator_data = {}
             response_upper = phase1_response.upper()
 
             if "NEED_ORDERBOOK" in response_upper or "NEED_MARKET" in response_upper or "NEED_BOTH" in response_upper:
-                self.console.print("[Phase 3] 收集额外市场数据...")
+                if verbose:
+                    self.console.print("[Phase 3] 收集额外市场数据...")
                 indicator_data = await self._execute_indicators_from_response(phase1_response, trader)
 
-                if indicator_data:
+                if verbose and indicator_data:
                     self.console.print(f"[完成] 已收集指标数据: {list(indicator_data.keys())}")
 
             # Phase 4: Final decision
-            self.console.print("[Phase 4] 做出最终决策...")
+            if verbose:
+                self.console.print("[Phase 4] 做出最终决策...")
             phase2_prompt = self._build_phase2_prompt(decision_context, indicator_data, phase1_response)
             final_decision = await self._call_claude_code_for_decision(phase2_prompt, trader_id)
 
@@ -1927,26 +2034,47 @@ If test files are created during testing, clean them up after tests pass."""
             for line in decision_lines:
                 line_upper = line.upper().strip()
                 for action in valid_actions:
-                    if line_upper.startswith(action):
+                    # Check if line starts with action OR contains action as a standalone word
+                    if line_upper.startswith(action) or f' {action} ' in f' {line_upper} ':
                         actual_decision = line.strip()
                         break
                 if actual_decision:
                     break
 
-            # If no valid action found, use first line
+            # If still no valid action, try to find action anywhere in the response
             if not actual_decision:
-                actual_decision = decision_lines[0].strip() if decision_lines else final_decision.strip()
+                response_upper = final_decision.upper()
+                for action in valid_actions:
+                    if f' {action} ' in f' {response_upper} ' or response_upper.startswith(action):
+                        # Extract the full line or construct from found action
+                        for line in decision_lines:
+                            if action in line.upper():
+                                actual_decision = line.strip()
+                                break
+                        if not actual_decision:
+                            # Just use the action itself
+                            actual_decision = action
+                        break
 
-            self.console.print(f"[AI 决策] {actual_decision}")
+            # If no valid action found, default to HOLD
+            if not actual_decision:
+                if verbose:
+                    self.console.print(f"[警告] 无法解析决策，默认为 HOLD: {final_decision[:100]}")
+                actual_decision = "HOLD"
+
+            if verbose:
+                self.console.print(f"[AI 决策] {actual_decision}")
 
             # Phase 5: Execute decision
             await self._execute_decision(actual_decision, trader_id)
-            self.console.print("[完成] 决策流程结束")
+            if verbose:
+                self.console.print("[完成] 决策流程结束")
 
         except Exception as e:
             self.console.print(f"[错误] 决策进程错误: {e}")
             import traceback
-            self.console.print(f"[调试] {traceback.format_exc()}")
+            if verbose:
+                self.console.print(f"[调试] {traceback.format_exc()}")
 
     def _build_decision_context(self, trader, open_positions, summary, profile_content):
         """Build decision context dict
@@ -2201,7 +2329,7 @@ Your decision (ONE LINE ONLY):"""
                     exchange = default_exchange
                     symbol = default_symbol
 
-                self.console.print(f"[指标] 运行 fetch_orderbook: {exchange} {symbol}")
+                print(f"[指标] 运行 fetch_orderbook: {exchange} {symbol}")
                 orderbook_data = await self._run_indicator("fetch_orderbook.py", [
                     "--exchange", exchange,
                     "--symbol", symbol
@@ -2223,7 +2351,7 @@ Your decision (ONE LINE ONLY):"""
                     symbol = default_symbol
                     interval = "1h"
 
-                self.console.print(f"[指标] 运行 market_data: {exchange} {symbol} {interval}")
+                print(f"[指标] 运行 market_data: {exchange} {symbol} {interval}")
                 market_data = await self._run_indicator("market_data.py", [
                     "--exchange", exchange,
                     "--symbol", symbol,
@@ -2339,7 +2467,7 @@ Your decision (ONE LINE ONLY):"""
                         await self._handle_closeposition_command([str(pos.id)])
 
             elif action == "HOLD":
-                self.console.print("[决策] 持有 - 无操作")
+                print("[决策] 持有 - 无操作")
 
             else:
                 self.console.print(f"[错误] 未知决策类型: {action}")
@@ -2815,6 +2943,7 @@ Your decision (ONE LINE ONLY):"""
                 table.add_column("方向", style="yellow", width=6)
                 table.add_column("杠杆", style="magenta", width=6)
                 table.add_column("入场价", style="white", width=12)
+                table.add_column("当前价", style="cyan", width=12)
                 table.add_column("数量", style="white", width=10)
                 table.add_column("保证金", style="white", width=10)
                 table.add_column("盈亏", style="white", width=12)
@@ -2839,6 +2968,10 @@ Your decision (ONE LINE ONLY):"""
                     status_str = pos.status.value
                     status_color = "green" if pos.status == PositionStatus.OPEN else "yellow"
 
+                    # Get current price from cache
+                    current_price = price_service.get_cached_price(pos.exchange, pos.symbol)
+                    current_price_str = f"{current_price:.2f}" if current_price else "N/A"
+
                     table.add_row(
                         str(pos.id),
                         pos.exchange,
@@ -2846,6 +2979,7 @@ Your decision (ONE LINE ONLY):"""
                         pos.position_side.value,
                         f"{pos.leverage:.1f}x",
                         f"{pos.entry_price:.2f}",
+                        current_price_str,
                         f"{pos.position_size:.4f}",
                         f"{pos.margin:.2f}",
                         pnl_str,
@@ -2914,6 +3048,512 @@ Your decision (ONE LINE ONLY):"""
             pos_db.close()
             trader_db.close()
 
+    async def _handle_optimize_command(self, args: list):
+        """Handle the /optimize command - AI self-optimization based on trading history
+
+        Analyzes trader's historical performance and suggests/updates strategy improvements.
+
+        Args:
+            args: Command arguments (trader_id)
+        """
+        import os
+        import subprocess
+
+        # Parse trader_id
+        if not args:
+            self.console.print("[red]错误: 请指定交易者 ID[/red]")
+            self.console.print("[yellow]用法: /optimize <trader_id>[/yellow]")
+            return
+
+        trader_id = args[0]
+
+        # Initialize databases
+        trader_db = TraderDatabase()
+        trader_db.initialize()
+        pos_db = PositionDatabase()
+        pos_db.initialize()
+
+        try:
+            # Get trader info
+            trader = trader_db.get_trader(trader_id)
+            if not trader:
+                self.console.print(f"[yellow]未找到 ID 为 '{trader_id}' 的交易者[/yellow]")
+                return
+
+            # Get trader file path
+            trader_file = trader.get('trader_file', '')
+            if not trader_file or not os.path.exists(trader_file):
+                self.console.print(f"[red]错误: 找不到交易者文件 {trader_file}[/red]")
+                return
+
+            # Get position history
+            positions_summary = pos_db.get_trader_positions_summary(trader_id)
+            all_positions = pos_db.list_positions(trader_id)
+
+            # Show trader info
+            chars = trader.get('characteristics', {})
+            name = chars.get('name', 'N/A')
+            style = trader.get('style', 'N/A').replace('_', ' ').title()
+            current_balance = trader.get('current_balance', 0)
+            initial_balance = trader.get('initial_balance', 0)
+
+            self.console.print(f"\n[bold cyan]正在优化交易者:[/bold cyan]")
+            self.console.print(f"  [dim]ID:[/dim] {trader_id}")
+            self.console.print(f"  [dim]名称:[/dim] {name}")
+            self.console.print(f"  [dim]风格:[/dim] {style}")
+            self.console.print(f"  [dim]文件:[/dim] {trader_file}\n")
+
+            # Display current performance summary
+            from rich.panel import Panel
+            from rich.text import Text
+
+            perf_text = Text()
+            perf_text.append(f"初始余额: {initial_balance:.2f} USDT\n", style="white")
+            perf_text.append(f"当前余额: {current_balance:.2f} USDT\n", style="cyan")
+            total_pnl = current_balance - initial_balance
+            perf_text.append(f"总盈亏: {total_pnl:+.2f} USDT", style="green" if total_pnl >= 0 else "red")
+
+            if total_pnl != 0:
+                roi = (total_pnl / initial_balance) * 100
+                perf_text.append(f" ({roi:+.2f}%)\n", style="green" if total_pnl >= 0 else "red")
+            else:
+                perf_text.append("\n")
+
+            perf_text.append(f"总仓位: {positions_summary['total_positions']}\n", style="white")
+            perf_text.append(f"已平仓: {positions_summary['closed_positions']}\n", style="yellow")
+            perf_text.append(f"已清算: {positions_summary['liquidated_positions']}\n", style="red")
+            perf_text.append(f"平均ROI: {positions_summary['average_roi']:.2f}%\n", style="cyan")
+
+            perf_panel = Panel(perf_text, title="[bold yellow]当前表现[/bold yellow]", border_style="yellow")
+            self.console.print(perf_panel)
+
+            # Check if there's enough data to optimize
+            if positions_summary['total_positions'] == 0:
+                self.console.print("[yellow]该交易者尚无交易记录，无法进行优化分析[/yellow]")
+                self.console.print("[dim]建议先使用 /decide 命令进行一些交易，积累历史数据后再进行优化[/dim]")
+                return
+
+            # Find Claude Code executable
+            claude_path = shutil.which("claude")
+            if not claude_path:
+                self.console.print("[red]错误: 未找到 Claude Code 可执行文件[/red]")
+                self.console.print("[yellow]请访问 https://code.claude.com 安装 Claude Code[/yellow]")
+                return
+
+            # Store file modification time
+            mtime_before = os.path.getmtime(trader_file)
+
+            # Build position history data for analysis
+            position_details = []
+            for pos in all_positions:
+                detail = {
+                    'symbol': pos.symbol,
+                    'side': pos.position_side.value,
+                    'status': pos.status.value,
+                    'entry_price': pos.entry_price,
+                    'exit_price': pos.exit_price,
+                    'realized_pnl': pos.realized_pnl,
+                    'roi': pos.roi,
+                    'leverage': pos.leverage,
+                    'entry_time': pos.entry_time.isoformat() if pos.entry_time else None,
+                    'exit_time': pos.exit_time.isoformat() if pos.exit_time else None,
+                }
+                position_details.append(detail)
+
+            # Convert to readable format for Claude
+            import json
+            positions_json = json.dumps(position_details, indent=2, ensure_ascii=False)
+
+            # Prepare comprehensive optimization instructions
+            instructions = f"""You are performing a self-optimization analysis for a cryptocurrency trader. Your goal is to analyze their historical performance and suggest/apply improvements to their trading strategy.
+
+**STEP 1: Read and Understand**
+
+Read the TRADERS.md file in the parent directory to understand the trader profile template.
+
+Read the current trader profile.md file in the current directory.
+
+**STEP 2: Analyze Performance Data**
+
+Trader Information:
+- ID: {trader_id}
+- Name: {name}
+- Style: {style}
+- Initial Balance: {initial_balance:.2f} USDT
+- Current Balance: {current_balance:.2f} USDT
+- Total PnL: {total_pnl:+.2f} USDT ({(total_pnl/initial_balance)*100:+.2f}%)
+
+Position Summary:
+- Total Positions: {positions_summary['total_positions']}
+- Closed: {positions_summary['closed_positions']}
+- Liquidated: {positions_summary['liquidated_positions']}
+- Average ROI: {positions_summary['average_roi']:.2f}%
+
+Complete Position History:
+{positions_json}
+
+**STEP 3: Analysis and Optimization**
+
+Analyze the trading performance and identify:
+1. **Win/Loss Patterns**: Which trades succeeded? Which failed? Why?
+2. **Risk Management**: Are stop losses effective? Is position sizing appropriate?
+3. **Market Conditions**: How does the trader perform in different market regimes?
+4. **Strategy Effectiveness**: Which aspects of the strategy work? Which don't?
+5. **Leverage Usage**: Is leverage being used responsibly?
+
+**STEP 4: Apply Optimizations**
+
+If you identify areas for improvement, modify the profile.md file:
+
+1. **Keep the same structure** - Maintain all sections from TRADERS.md
+2. **Keep the same ID** - Trader ID must remain {trader_id}
+3. **Adjust strategy parameters** based on your analysis:
+   - Risk tolerance and position sizing
+   - Stop loss and take profit levels
+   - Leverage limits
+   - Trading pair selection
+   - Indicator parameters
+   - Timeframe preferences
+
+4. **Add lessons learned** in the "Performance Notes" or "Strategy" section
+
+5. **Document changes** - If you make changes, explain WHY in the profile
+
+**STEP 5: Decision**
+
+After your analysis:
+- If performance is good with clear strengths: Make minor tweaks or add positive reinforcement notes
+- If there are clear issues: Modify the strategy to address them
+- If there's insufficient data: Add notes about what data to collect
+
+**IMPORTANT:**
+- ONLY modify profile.md if you have a clear, data-driven reason
+- Preserve the trader's core identity (name, basic style)
+- Focus on parameter tuning and risk management improvements
+- Save your changes to profile.md in the current directory
+
+Begin your optimization analysis now."""
+
+            self.console.print("[cyan]正在调用 Claude Code 进行自我优化分析...[/cyan]\n")
+
+            try:
+                # Run Claude Code as subprocess with real-time output
+                self.console.print("[dim]Claude Code 正在分析历史数据...[/dim]\n")
+
+                process = subprocess.Popen(
+                    [claude_path, "--print", instructions],
+                    cwd=str(os.path.dirname(trader_file)),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+
+                # Stream output in real-time
+                output_lines = []
+                try:
+                    for line in process.stdout:
+                        output_lines.append(line.rstrip())
+                        self.console.print(f"[dim]{line.rstrip()}[/dim]")
+                except Exception as e:
+                    process.kill()
+                    raise e
+
+                # Wait for process to complete
+                try:
+                    return_code = process.wait(timeout=300)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    self.console.print("[red]错误: Claude Code 执行超时（5分钟）[/red]")
+                    return
+
+                # Check if file was modified
+                mtime_after = os.path.getmtime(trader_file)
+
+                if mtime_after == mtime_before:
+                    self.console.print("\n[yellow]分析完成，档案无需修改[/yellow]")
+                    self.console.print("[dim]交易者当前表现良好，或暂无明显改进空间[/dim]")
+                else:
+                    # Re-parse the modified trader file
+                    trader_path = Path(trader_file)
+                    updated_data = self._parse_trader_file(trader_path)
+
+                    # Prepare database update record
+                    update_record = {
+                        'characteristics': updated_data.get('characteristics', {}),
+                        'style': updated_data.get('style', ''),
+                        'strategy': updated_data.get('strategy', {}),
+                        'trading_pairs': updated_data.get('trading_pairs', []),
+                        'timeframes': updated_data.get('timeframes', []),
+                        'indicators': updated_data.get('indicators', []),
+                        'information_sources': updated_data.get('information_sources', []),
+                        'metadata': updated_data.get('metadata', {})
+                    }
+
+                    # Update database
+                    success = trader_db.update_trader(trader_id, update_record)
+
+                    if success:
+                        self.console.print("\n[green]✓ 交易者档案已优化并更新[/green]")
+                        self.console.print(f"[dim]数据库记录已同步[/dim]")
+                    else:
+                        self.console.print("\n[yellow]警告: 文件已修改，但数据库更新失败[/yellow]")
+
+            except subprocess.TimeoutExpired:
+                self.console.print("[red]错误: Claude Code 执行超时 (5分钟)[/red]")
+            except Exception as e:
+                self.console.print(f"[red]错误: {e}[/red]")
+                import traceback
+                self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
+
+        except Exception as e:
+            self.console.print(f"[red]错误: {e}[/red]")
+            import traceback
+            self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
+        finally:
+            trader_db.close()
+            pos_db.close()
+
+    async def _handle_start_command(self, args: list):
+        """启动持续运行模式
+
+        Args:
+            args: [trader_id1, trader_id2, ...] 或空（启动所有 trader）
+        """
+        # 确保数据库已初始化
+        if not hasattr(self, 'trader_db') or self.trader_db is None:
+            self.trader_db = TraderDatabase()
+            self.trader_db.initialize()
+
+        if not hasattr(self, 'pos_db') or self.pos_db is None:
+            self.pos_db = PositionDatabase()
+            self.pos_db.initialize()
+
+        # 获取要调度的 trader ID 列表
+        trader_ids = args if args else None
+
+        # 创建调度器（传递数据库实例）
+        if not hasattr(self, 'scheduler') or self.scheduler is None:
+            from .scheduler import TraderScheduler
+            self.scheduler = TraderScheduler(self, self.trader_db, self.pos_db)
+
+        # 启动调度器
+        await self.scheduler.start(trader_ids)
+
+        # 简化输出
+        if trader_ids:
+            print(f"✓ 已为 {len(trader_ids)} 个 trader 启动持续运行模式")
+        else:
+            all_traders = self.trader_db.list_traders()
+            print(f"✓ 已为所有 {len(all_traders)} 个 trader 启动持续运行模式")
+
+        print("提示: 输入 /status 查看状态，/stop 停止运行")
+
+    async def _handle_stop_command(self, args: list):
+        """停止持续运行模式"""
+        if not hasattr(self, 'scheduler') or not self.scheduler.running:
+            print("调度器未运行")
+            return
+
+        await self.scheduler.stop()
+
+    async def _handle_status_command(self, args: list):
+        """显示调度器状态"""
+        if not hasattr(self, 'scheduler') or not self.scheduler.running:
+            self.console.print("[dim]调度器未运行[/dim]")
+            self.console.print("[dim]提示: 使用 /start [trader_ids] 启动调度器[/dim]")
+            return
+
+        from rich.table import Table
+        from rich.panel import Panel
+
+        status = self.scheduler.get_status()
+
+        # 总体状态面板
+        status_text = f"""
+[bold cyan]调度器状态[/bold cyan]
+
+运行状态: [{'green' if status['running'] else 'red'}]{'运行中' if status['running'] else '已停止'}[/]
+监控 Trader: {status['total_traders']} (活跃: {status['enabled_traders']})
+队列任务: {status['queue_size']}
+"""
+        self.console.print(Panel(status_text.strip(), border_style="cyan"))
+
+        # 显示队列摘要
+        queue_summary = status.get('queue_summary', {})
+        if queue_summary.get('total_tasks', 0) > 0:
+            by_action = queue_summary.get('tasks_by_action', {})
+            self.console.print(f"[dim]队列中的任务: {queue_summary['total_tasks']}[/dim]")
+            for action, count in by_action.items():
+                if count > 0:
+                    self.console.print(f"  [dim]- {action}: {count}[/dim]")
+
+        # Trader 状态表格
+        if status['traders']:
+            table = Table(title="\n[bold]Trader 调度状态[/bold]")
+            table.add_column("Trader ID", style="cyan")
+            table.add_column("状态", justify="center")
+            table.add_column("上次触发", style="dim")
+            table.add_column("触发次数", justify="right")
+            table.add_column("处理中", justify="center")
+
+            for t in status['traders']:
+                trader_id = t['trader_id']
+                enabled = t['enabled']
+                last_trigger = t['last_trigger']
+                total_triggers = t['total_triggers']
+                processing = t['processing']
+
+                # 状态显示
+                status_str = "[green]✓[/green]" if enabled else "[red]✗[/red]"
+
+                # 上次触发时间
+                if last_trigger:
+                    last_str = last_trigger.strftime("%H:%M:%S")
+                else:
+                    last_str = "-"
+
+                # 处理中标记
+                proc_str = "[yellow]是[/yellow]" if processing else ""
+
+                table.add_row(trader_id, status_str, last_str, str(total_triggers), proc_str)
+
+            self.console.print(table)
+
+    async def _handle_config_command(self, args: list):
+        """查看或修改配置
+
+        Args:
+            args: [key] [value] 或 'list' 或 'reset'
+        """
+        from .scheduler_config import get_scheduler_config
+
+        config = get_scheduler_config()
+
+        if not args:
+            # 显示所有配置
+            self._show_all_config(config)
+            return
+
+        if args[0] == 'list':
+            # 列出所有配置
+            self._show_all_config(config)
+
+        elif args[0] == 'reset':
+            # 重置为默认值
+            from rich.prompt import Confirm
+            if await self._confirm_async("确认要重置所有配置为默认值吗？"):
+                config.reset_to_defaults()
+                self.console.print("[green]✓ 配置已重置为默认值[/green]")
+
+        elif len(args) == 1:
+            # 显示单个配置
+            key = args[0]
+            value = config.get(key)
+            if value is None:
+                self.console.print(f"[red]未找到配置: {key}[/red]")
+            else:
+                all_config = config.get_all()
+                info = all_config.get(key, {})
+                self.console.print(f"[cyan]{key}[/cyan] = {value}")
+                if info.get('description'):
+                    self.console.print(f"[dim]类型: {info['type']}[/dim]")
+                    self.console.print(f"[dim]说明: {info['description']}[/dim]")
+
+        elif len(args) >= 2:
+            # 设置配置
+            key = args[0]
+            value_str = ' '.join(args[1:])
+
+            # 尝试解析值
+            try:
+                # 尝试布尔值
+                if value_str.lower() in ('true', 'false'):
+                    value = value_str.lower() == 'true'
+                # 尝试数字
+                elif '.' in value_str:
+                    value = float(value_str)
+                else:
+                    value = int(value_str)
+
+                config.set(key, value)
+                self.console.print(f"[green]✓ 已设置: {key} = {value}[/green]")
+
+            except ValueError:
+                # 作为字符串处理
+                config.set(key, value_str)
+                self.console.print(f"[green]✓ 已设置: {key} = {value_str}[/green]")
+
+    def _show_all_config(self, config):
+        """显示所有配置
+
+        Args:
+            config: SchedulerConfig instance
+        """
+        from rich.table import Table
+
+        all_config = config.get_all()
+
+        table = Table(title="[bold cyan]调度器配置[/bold cyan]")
+        table.add_column("配置键", style="cyan")
+        table.add_column("值", style="yellow")
+        table.add_column("类型", style="dim")
+        table.add_column("说明", style="dim")
+
+        # 分组显示
+        groups = {
+            'scheduler': '调度器',
+            'trigger.time': '时间触发',
+            'trigger.price': '价格触发',
+            'optimize': '优化',
+            'priority': '优先级'
+        }
+
+        # 按分组排序
+        sorted_keys = sorted(all_config.keys(), key=lambda k: (
+            list(groups.keys()).index(k.split('.')[0]) if k.split('.')[0] in groups else 999,
+            k
+        ))
+
+        current_group = None
+        for key in sorted_keys:
+            info = all_config[key]
+            group_key = key.split('.')[0] if '.' in key else key
+
+            # 添加分组标题行
+            if group_key in groups and group_key != current_group:
+                table.add_row("", "", "", "")
+                table.add_row(f"[bold]{groups[group_key]}[/bold]", "", "", "")
+                current_group = group_key
+
+            value_str = str(info['value'])
+            if len(value_str) > 30:
+                value_str = value_str[:27] + "..."
+
+            table.add_row(
+                key,
+                value_str,
+                info['type'],
+                info.get('description', '')[:50]
+            )
+
+        self.console.print(table)
+
+    async def _confirm_async(self, message: str) -> bool:
+        """异步确认提示
+
+        Args:
+            message: 确认消息
+
+        Returns:
+            True if confirmed
+        """
+        from rich.prompt import Confirm
+
+        # 在 async context 中使用同步 prompt
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: Confirm.ask(message))
+
     async def run(self):
         """运行 CLI 主循环"""
         self._print_banner()
@@ -2970,6 +3610,21 @@ Your decision (ONE LINE ONLY):"""
 
                 elif command == "/positions":
                     await self._handle_positions_command(args)
+
+                elif command == "/optimize":
+                    await self._handle_optimize_command(args)
+
+                elif command == "/start":
+                    await self._handle_start_command(args)
+
+                elif command == "/stop":
+                    await self._handle_stop_command(args)
+
+                elif command == "/status":
+                    await self._handle_status_command(args)
+
+                elif command == "/config":
+                    await self._handle_config_command(args)
 
                 else:
                     self.console.print(

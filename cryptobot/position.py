@@ -84,6 +84,12 @@ class Position:
     def calculate_unrealized_pnl(self, current_price: float) -> float:
         """Calculate unrealized PnL based on current price
 
+        In perpetual futures, leverage affects margin requirement but NOT the PnL calculation.
+        If you open a 1 BTC position with 10x leverage:
+        - You control 1 BTC worth of position
+        - Price change of 1 USDT = 1 USDT PnL change (not 10 USDT)
+        - Leverage only means you need less margin to control the same position
+
         Args:
             current_price: Current market price
 
@@ -97,10 +103,10 @@ class Position:
 
         if self.position_side == PositionSide.LONG:
             # Long: profit when price goes up
-            pnl = self.position_size * price_diff * self.leverage
+            pnl = self.position_size * price_diff
         else:
             # Short: profit when price goes down
-            pnl = self.position_size * (-price_diff) * self.leverage
+            pnl = self.position_size * (-price_diff)
 
         # Subtract entry fee
         return pnl - self.entry_fee
