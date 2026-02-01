@@ -77,6 +77,7 @@ class CryptoBot:
   /intervals  - 显示支持的周期
   /traders [id] [-p]  - 查看/修改交易者档案 (查看仓位使用 -p)
   /newtrader [prompt]  - Generate new trader using AI
+  /decide <trader_id>  - AI 自动交易决策 (CSV 指标)
   /openposition <trader_id> <exchange> <symbol> <side> <size> [leverage]  - 开仓
   /closeposition <position_id> [price]  - 平仓
   /help  - 显示帮助
@@ -177,6 +178,22 @@ class CryptoBot:
     /newtrader create a conservative trader  # Generate with specific characteristics
 
   注意: 新的交易者将以文件夹形式创建，如: traders/TraderName_ID/profile.md
+
+[bold yellow]/decide <trader_id>[/bold yellow]
+  AI 自动交易决策
+  参数说明:
+    trader_id  - 交易者 ID
+
+  示例:
+    /decide 1              # 为交易员 1 执行 AI 决策
+
+  决策流程:
+    1. 收集交易员档案、仓位、PnL 数据
+    2. AI 分析是否需要额外市场数据
+    3. 如需要，自动调用 indicators/ 中的指标脚本 (CSV 输出)
+    4. AI 基于完整数据做出决策并执行
+
+  可能的决策: 开仓 (OPEN_LONG/OPEN_SHORT)、平仓 (CLOSE_POSITION)、清仓 (CLOSE_ALL)、持有 (HOLD)
 
 [bold yellow]/help[/bold yellow]
   显示此帮助信息
@@ -1311,6 +1328,555 @@ Important:
             import traceback
             self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
 
+    async def _handle_decide_command(self, args: list):
+        """Handle the /decide command - AI-driven trading decision
+
+        Args:
+            args: Command arguments (trader_id [--wait])
+        """
+        import os
+        import json
+        import tempfile
+        from pathlib import Path
+
+        if not args:
+            self.console.print("[red]错误: 请提供 trader_id[/red]")
+            return
+
+        trader_id = args[0]
+
+        # Verify trader exists
+        with TraderDatabase() as db:
+            trader = db.get_trader(trader_id)
+            if not trader:
+                self.console.print(f"[red]错误: 未找到交易员 {trader_id}[/red]")
+                return
+
+        # Check if --wait flag is present
+        wait_for_completion = '--wait' in args
+
+        # Execute decision (wait for completion by default for better UX)
+        await self._execute_decision_process(trader_id)
+
+    async def _execute_decision_process(self, trader_id: str):
+        """Execute the full decision workflow
+
+        Args:
+            trader_id: Trader ID
+        """
+        import os
+        import json
+        import tempfile
+        from pathlib import Path
+
+        try:
+            # Phase 1: Gather data
+            self.console.print(f"[Phase 1] 收集交易员 {trader_id} 数据...")
+
+            # Get trader profile
+            with TraderDatabase() as db:
+                trader = db.get_trader(trader_id)
+
+            # Get trader profile file content
+            trader_file = Path(trader['trader_file'])
+            if trader_file.exists():
+                profile_content = trader_file.read_text(encoding='utf-8')
+            else:
+                profile_content = "Profile file not found"
+
+            # Get position information
+            with PositionDatabase() as pos_db:
+                open_positions = pos_db.list_positions(trader_id, status='open')
+                try:
+                    summary = pos_db.get_trader_positions_summary(trader_id)
+                except Exception:
+                    summary = {
+                        'total_unrealized_pnl': 0,
+                        'total_realized_pnl': 0,
+                        'open_count': len(open_positions),
+                        'average_roi': 0
+                    }
+
+            # Update positions with current prices
+            price_service = get_price_service()
+            try:
+                await price_service.update_trader_positions(trader_id, pos_db)
+                # Refresh positions after update
+                open_positions = pos_db.list_positions(trader_id, status='open')
+                summary = pos_db.get_trader_positions_summary(trader_id)
+            except Exception as e:
+                self.console.print(f"[警告] 无法更新价格: {e}")
+
+            # Build decision context
+            decision_context = self._build_decision_context(trader, open_positions, summary, profile_content)
+
+            # Phase 2: AI initial assessment
+            self.console.print("[Phase 2] AI 初步分析中...")
+            phase1_prompt = self._build_phase1_prompt(decision_context)
+            phase1_response = await self._call_claude_code_for_decision(phase1_prompt, trader_id)
+
+            if not phase1_response or phase1_response.startswith("ERROR"):
+                self.console.print(f"[错误] AI 调用失败: {phase1_response}")
+                return
+
+            # Show brief summary of AI response
+            response_lines = phase1_response.strip().split('\n')
+            first_line = response_lines[0] if response_lines else phase1_response[:100]
+            self.console.print(f"[AI 响应] {first_line}")
+
+            # Phase 3: Execute indicators if needed
+            indicator_data = {}
+            response_upper = phase1_response.upper()
+
+            if "NEED_ORDERBOOK" in response_upper or "NEED_MARKET" in response_upper or "NEED_BOTH" in response_upper:
+                self.console.print("[Phase 3] 收集额外市场数据...")
+                indicator_data = await self._execute_indicators_from_response(phase1_response, trader)
+
+                if indicator_data:
+                    self.console.print(f"[完成] 已收集指标数据: {list(indicator_data.keys())}")
+
+            # Phase 4: Final decision
+            self.console.print("[Phase 4] 做出最终决策...")
+            phase2_prompt = self._build_phase2_prompt(decision_context, indicator_data, phase1_response)
+            final_decision = await self._call_claude_code_for_decision(phase2_prompt, trader_id)
+
+            if not final_decision or final_decision.startswith("ERROR"):
+                self.console.print(f"[错误] 最终决策失败: {final_decision}")
+                return
+
+            # Extract decision from response - look for valid action keywords
+            decision_lines = final_decision.strip().split('\n')
+            actual_decision = None
+
+            # Valid action keywords
+            valid_actions = ['OPEN_LONG', 'OPEN_SHORT', 'CLOSE_POSITION', 'CLOSE_ALL', 'HOLD']
+
+            # Find the line containing a valid action
+            for line in decision_lines:
+                line_upper = line.upper().strip()
+                for action in valid_actions:
+                    if line_upper.startswith(action):
+                        actual_decision = line.strip()
+                        break
+                if actual_decision:
+                    break
+
+            # If no valid action found, use first line
+            if not actual_decision:
+                actual_decision = decision_lines[0].strip() if decision_lines else final_decision.strip()
+
+            self.console.print(f"[AI 决策] {actual_decision}")
+
+            # Phase 5: Execute decision
+            await self._execute_decision(actual_decision, trader_id)
+            self.console.print("[完成] 决策流程结束")
+
+        except Exception as e:
+            self.console.print(f"[错误] 决策进程错误: {e}")
+            import traceback
+            self.console.print(f"[调试] {traceback.format_exc()}")
+
+    def _build_decision_context(self, trader, open_positions, summary, profile_content):
+        """Build decision context dict
+
+        Args:
+            trader: Trader database record
+            open_positions: List of open positions
+            summary: Position summary
+            profile_content: Trader profile markdown content
+
+        Returns:
+            Decision context dictionary
+        """
+        # Parse trader characteristics
+        import json
+        characteristics = json.loads(trader['characteristics']) if isinstance(trader.get('characteristics'), str) else trader.get('characteristics', {})
+        strategy = json.loads(trader['strategy']) if isinstance(trader.get('strategy'), str) else trader.get('strategy', {})
+        trading_pairs = json.loads(trader['trading_pairs']) if isinstance(trader.get('trading_pairs'), str) else trader.get('trading_pairs', [])
+        timeframes = json.loads(trader['timeframes']) if isinstance(trader.get('timeframes'), str) else trader.get('timeframes', [])
+
+        return {
+            'trader': {
+                'id': trader['id'],
+                'balance': trader.get('current_balance', 10000.0),
+                'equity': trader.get('equity', 10000.0),
+                'characteristics': characteristics,
+                'strategy': strategy,
+                'trading_pairs': trading_pairs,
+                'timeframes': timeframes,
+                'profile_content': profile_content[:2000]  # Truncate for brevity
+            },
+            'positions': {
+                'open': [self._position_to_dict(p) for p in open_positions],
+                'summary': summary
+            }
+        }
+
+    def _position_to_dict(self, position):
+        """Convert position object to dict
+
+        Args:
+            position: Position object or dict
+
+        Returns:
+            Dictionary representation
+        """
+        if hasattr(position, 'to_dict'):
+            return position.to_dict()
+        elif isinstance(position, dict):
+            return position
+        else:
+            return {
+                'id': getattr(position, 'id', None),
+                'symbol': getattr(position, 'symbol', ''),
+                'side': getattr(position, 'side', ''),
+                'size': getattr(position, 'size', 0),
+                'entry_price': getattr(position, 'entry_price', 0),
+                'unrealized_pnl': getattr(position, 'unrealized_pnl', 0),
+                'roi': getattr(position, 'roi', 0)
+            }
+
+    def _build_phase1_prompt(self, context):
+        """Build Phase 1 prompt for initial AI assessment
+
+        Args:
+            context: Decision context dictionary
+
+        Returns:
+            Prompt string for Claude Code
+        """
+        trader = context['trader']
+        positions = context['positions']
+
+        # Format position info
+        pos_info = ""
+        if positions['open']:
+            pos_info = f"\n当前持仓 ({len(positions['open'])}):\n"
+            for p in positions['open'][:5]:  # Limit to 5 positions
+                pos_info += f"  - {p.get('symbol')} {p.get('side')} size={p.get('size')} entry={p.get('entry_price')} pnl={p.get('unrealized_pnl', 0):.2f}\n"
+            pos_info += f"\n总未实现盈亏: {positions['summary'].get('total_unrealized_pnl', 0):.2f}\n"
+            pos_info += f"总已实现盈亏: {positions['summary'].get('total_realized_pnl', 0):.2f}\n"
+        else:
+            pos_info = "\n当前持仓: 无\n"
+
+        return f"""You are a trading decision engine for trader {trader['id']}.
+
+TRADER PROFILE:
+{trader['profile_content']}
+
+TRADER DATA:
+- Balance: ${trader['balance']:.2f}
+- Equity: ${trader['equity']:.2f}
+- Trading pairs: {', '.join(trader['trading_pairs'][:5])}
+- Timeframes: {', '.join(trader['timeframes'])}
+{pos_info}
+
+TASK: Decide if additional market data is needed before making a trading decision.
+
+Available indicators (CSV format):
+- fetch_orderbook: Order book depth (side,price,volume)
+- market_data: OHLCV with indicators (open,high,low,close,volume,rsi,trend,support,resistance)
+
+Respond with ONE of:
+- NO_DECISION_NEEDED
+- NEED_ORDERBOOK <exchange> <symbol>
+- NEED_MARKET_DATA <exchange> <symbol> <interval>
+- NEED_BOTH <exchange> <symbol> <interval>
+
+Your decision:"""
+
+    def _build_phase2_prompt(self, context, indicator_data, phase1_response):
+        """Build Phase 2 prompt for final decision
+
+        Args:
+            context: Decision context dictionary
+            indicator_data: Collected indicator data (CSV strings)
+            phase1_response: Phase 1 AI response
+
+        Returns:
+            Prompt string for Claude Code
+        """
+        trader = context['trader']
+        positions = context['positions']
+
+        # Format indicator data (CSV format)
+        indicator_text = ""
+        if indicator_data:
+            indicator_text = "\nADDITIONAL MARKET DATA (CSV format):\n"
+            for key, value in indicator_data.items():
+                # Truncate to max 50 lines to save tokens
+                lines = value.strip().split('\n')
+                if len(lines) > 50:
+                    preview = '\n'.join(lines[:25]) + '\n...\n' + '\n'.join(lines[-25:])
+                else:
+                    preview = value.strip()
+                indicator_text += f"\n{key}:\n{preview}\n"
+        else:
+            indicator_text = "\nNo additional indicator data was collected.\n"
+
+        return f"""{indicator_text}
+
+TRADER CONTEXT:
+- Trader ID: {trader['id']}
+- Balance: ${trader['balance']:.2f}
+- Current Positions: {len(positions['open'])}
+
+Make your final trading decision based on:
+1. Trader profile and strategy
+2. Current positions and PnL
+3. Market data (CSV format - analyze independently)
+
+IMPORTANT: Respond with ONLY the action command below, no explanation:
+
+- "OPEN_LONG <exchange> <symbol> <size> [leverage]"
+- "OPEN_SHORT <exchange> <symbol> <size> [leverage]"
+- "CLOSE_POSITION <position_id>"
+- "CLOSE_ALL"
+- "HOLD"
+
+Examples:
+OPEN_LONG binance BTCUSDT 0.1 5
+OPEN_SHORT okx ETHUSDT 1.0
+CLOSE_POSITION 123
+CLOSE_ALL
+HOLD
+
+Constraints:
+- Size should be 1-10% of balance (current: ${trader['balance']:.2f})
+- Leverage is optional, default is 1
+- Exchange: binance, okx, bybit, bitget
+
+Your decision (ONE LINE ONLY):"""
+
+    async def _call_claude_code_for_decision(self, prompt: str, trader_id: str):
+        """Call Claude Code subprocess for AI decision
+
+        Args:
+            prompt: Prompt string
+            trader_id: Trader ID for logging
+
+        Returns:
+            Claude Code response string
+        """
+        claude_path = shutil.which("claude")
+        if not claude_path:
+            return "ERROR: Claude Code not installed"
+
+        # Use stdin to pass the prompt
+        try:
+            process = await asyncio.create_subprocess_exec(
+                claude_path,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            # Send prompt via stdin with timeout
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(input=prompt.encode()),
+                timeout=300  # 5 minutes
+            )
+
+            if process.returncode != 0:
+                error_msg = stderr.decode() if stderr else "Unknown error"
+                return f"ERROR: Claude Code failed: {error_msg}"
+
+            return stdout.decode().strip()
+
+        except asyncio.TimeoutError:
+            if process:
+                process.kill()
+            return "ERROR: Claude Code timeout (5 minutes)"
+        except Exception as e:
+            return f"ERROR: {str(e)}"
+
+    async def _execute_indicators_from_response(self, response: str, trader):
+        """Execute indicators based on AI response
+
+        Args:
+            response: AI response string
+            trader: Trader database record
+
+        Returns:
+            Dictionary of indicator results (CSV strings)
+        """
+        import json
+        from pathlib import Path
+
+        results = {}
+        response_upper = response.upper()
+
+        # Parse trading pairs from trader
+        trading_pairs = json.loads(trader['trading_pairs']) if isinstance(trader.get('trading_pairs'), str) else trader.get('trading_pairs', [])
+        default_symbol = trading_pairs[0] if trading_pairs else "BTCUSDT"
+        default_exchange = "binance"
+
+        # Extract parameters from response
+        import re
+        orderbook_match = re.search(r'NEED_ORDERBOOK\s+(\w+)\s+(\w+)', response_upper)
+        market_match = re.search(r'NEED_MARKET_DATA\s+(\w+)\s+(\w+)\s+(\w+)', response_upper)
+        both_match = re.search(r'NEED_BOTH\s+(\w+)\s+(\w+)\s+(\w+)', response_upper)
+
+        try:
+            if "NEED_ORDERBOOK" in response_upper or both_match:
+                if orderbook_match:
+                    exchange = orderbook_match.group(1).lower()
+                    symbol = orderbook_match.group(2).upper()
+                elif both_match:
+                    exchange = both_match.group(1).lower()
+                    symbol = both_match.group(2).upper()
+                else:
+                    exchange = default_exchange
+                    symbol = default_symbol
+
+                self.console.print(f"[指标] 运行 fetch_orderbook: {exchange} {symbol}")
+                orderbook_data = await self._run_indicator("fetch_orderbook.py", [
+                    "--exchange", exchange,
+                    "--symbol", symbol
+                ])
+                if orderbook_data and not orderbook_data.startswith("error"):
+                    results['orderbook'] = orderbook_data
+
+            if "NEED_MARKET" in response_upper or both_match:
+                if market_match:
+                    exchange = market_match.group(1).lower()
+                    symbol = market_match.group(2).upper()
+                    interval = market_match.group(3).lower()
+                elif both_match:
+                    exchange = both_match.group(1).lower()
+                    symbol = both_match.group(2).upper()
+                    interval = both_match.group(3).lower()
+                else:
+                    exchange = default_exchange
+                    symbol = default_symbol
+                    interval = "1h"
+
+                self.console.print(f"[指标] 运行 market_data: {exchange} {symbol} {interval}")
+                market_data = await self._run_indicator("market_data.py", [
+                    "--exchange", exchange,
+                    "--symbol", symbol,
+                    "--interval", interval
+                ])
+                if market_data and not market_data.startswith("error"):
+                    results['market_data'] = market_data
+
+        except Exception as e:
+            self.console.print(f"[警告] 指标执行异常: {e}")
+
+        return results
+
+    async def _run_indicator(self, script_name: str, args: list):
+        """Run an indicator script and parse CSV output
+
+        Args:
+            script_name: Name of the indicator script
+            args: Command line arguments
+
+        Returns:
+            CSV data as string or None
+        """
+        from pathlib import Path
+
+        indicators_dir = Path(__file__).parent.parent / "indicators"
+        script_path = indicators_dir / script_name
+
+        if not script_path.exists():
+            self.console.print(f"[错误] 指标脚本不存在: {script_path}")
+            return None
+
+        cmd = [sys.executable, str(script_path)] + args
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=60  # 1 minute timeout
+            )
+
+            if process.returncode != 0:
+                self.console.print(f"[警告] 指标脚本错误: {stderr.decode()[:100]}")
+                return None
+
+            return stdout.decode()
+
+        except asyncio.TimeoutError:
+            process.kill()
+            self.console.print(f"[警告] 指标超时: {script_name}")
+            return None
+        except Exception as e:
+            self.console.print(f"[警告] 指标执行失败: {e}")
+            return None
+
+    async def _execute_decision(self, decision: str, trader_id: str):
+        """Parse and execute AI decision
+
+        Args:
+            decision: Decision string from AI
+            trader_id: Trader ID
+        """
+        decision = decision.strip()
+        parts = decision.split()
+        if not parts:
+            self.console.print("[决策] 空决策，无操作")
+            return
+
+        action = parts[0].upper()
+
+        try:
+            if action == "OPEN_LONG":
+                # Parse: OPEN_LONG <exchange> <symbol> <size> [leverage]
+                if len(parts) < 4:
+                    self.console.print(f"[错误] 无效的 OPEN_LONG 格式: {decision}")
+                    return
+                exchange = parts[1]
+                symbol = parts[2]
+                size = float(parts[3])
+                leverage = int(parts[4]) if len(parts) > 4 else None
+                await self._handle_openposition_command([trader_id, exchange, symbol, "long", str(size)] + ([str(leverage)] if leverage else []))
+
+            elif action == "OPEN_SHORT":
+                # Parse: OPEN_SHORT <exchange> <symbol> <size> [leverage]
+                if len(parts) < 4:
+                    self.console.print(f"[错误] 无效的 OPEN_SHORT 格式: {decision}")
+                    return
+                exchange = parts[1]
+                symbol = parts[2]
+                size = float(parts[3])
+                leverage = int(parts[4]) if len(parts) > 4 else None
+                await self._handle_openposition_command([trader_id, exchange, symbol, "short", str(size)] + ([str(leverage)] if leverage else []))
+
+            elif action == "CLOSE_POSITION":
+                # Parse: CLOSE_POSITION <position_id>
+                if len(parts) < 2:
+                    self.console.print(f"[错误] 无效的 CLOSE_POSITION 格式: {decision}")
+                    return
+                position_id = parts[1]
+                await self._handle_closeposition_command([position_id])
+
+            elif action == "CLOSE_ALL":
+                # Close all positions for trader
+                with PositionDatabase() as db:
+                    positions = db.list_positions(trader_id, status='open')
+                    for pos in positions:
+                        self.console.print(f"[执行] 平仓: {pos.id}")
+                        await self._handle_closeposition_command([str(pos.id)])
+
+            elif action == "HOLD":
+                self.console.print("[决策] 持有 - 无操作")
+
+            else:
+                self.console.print(f"[错误] 未知决策类型: {action}")
+
+        except Exception as e:
+            self.console.print(f"[错误] 执行决策失败: {e}")
+            import traceback
+            self.console.print(f"[调试] {traceback.format_exc()}")
+
     async def _show_trader_positions(self, trader_id: str):
         """Display trader's positions with updated PnL
 
@@ -1736,6 +2302,9 @@ Important:
 
                 elif command == "/newtrader":
                     await self._handle_newtrader_command(args)
+
+                elif command == "/decide":
+                    await self._handle_decide_command(args)
 
                 elif command == "/openposition":
                     await self._handle_openposition_command(args)
