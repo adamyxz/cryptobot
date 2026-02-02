@@ -13,11 +13,13 @@
 
 ## Characteristics
 
-- **Risk Tolerance:** Very Aggressive
-- **Capital Allocation:** 15-25% per trade (concentrated positions, high conviction)
-- **Max Drawdown Limit:** 35% (accepts large drawdowns as cost of doing business)
+- **Risk Tolerance:** Aggressive (downgraded from Very Aggressive due to drawdown)
+- **Capital Allocation:** 10-15% per trade (reduced from 15-25% for better risk control)
+- **Max Drawdown Limit:** 20% (reduced from 35% - current -24% drawdown unacceptable)
 - **Preferred Position Size:** Medium (optimizes for quick entries/exits)
-- **Leverage Usage:** Aggressive (routinely uses 3-5x leverage on futures, occasionally up to 10x on high-conviction setups)
+- **Leverage Usage:** Moderate (2-3x maximum, reduced from 3-5x - drawdown proved higher leverage too risky)
+- **Short Selling Willingness:** Always (MUST scan for short setups - current performance shows long-only bias)
+- **Directional Bias:** Opportunistic Both (MUST trade both long and short setups - Feb 2026 shows dangerous long-only bias)
 
 ## Trading Style
 
@@ -31,6 +33,10 @@
 ### Entry Conditions
 
 **Momentum Breakout Criteria:**
+
+**CRITICAL: SCAN FOR BOTH LONG AND SHORT SETUPS** - Current performance shows dangerous long-only bias. Must apply these criteria symmetrically to both directions.
+
+**Long Entry:**
 1. **Preparation:**
    - Identify assets with high ATR (Average True Range) - above 20-period average
    - Volume must be above average (1.5x normal) in last 3-4 candles
@@ -40,6 +46,17 @@
    - Breakout above resistance with volume spike (2x+ average)
    - Momentum confirmation: RSI(14) breaks above 60 and rising
    - Price closes above breakout level (not just wick)
+
+**Short Entry (Mirror of Long):**
+1. **Preparation:**
+   - Identify assets with high ATR (Average True Range) - above 20-period average
+   - Volume must be above average (1.5x normal) in last 3-4 candles
+   - Price in clear consolidation range (1-3% range) for 2-4 hours
+
+2. **Trigger:**
+   - Breakdown below support with volume spike (2x+ average)
+   - Momentum confirmation: RSI(14) breaks below 40 and falling
+   - Price closes below breakdown level (not just wick)
    - No immediate pullback after breakout (holds level for 2+ candles)
 
 3. **Additional Filters:**
@@ -50,27 +67,35 @@
 
 ### Exit Conditions
 
+**CRITICAL ENFORCEMENT RULES (Updated after -24% drawdown analysis):**
+
 - **Take Profit:**
   - Primary: 1.5x ATR from entry (quick momentum target)
   - Secondary: Previous resistance level (often equal to breakout range height)
-  - Time-based: Exit 80% of position if target not hit within 2 hours
+  - **MANDATORY:** Take 50% profit at 1x ATR - no exceptions (current SOL position +94% shows greedy holding)
+  - Time-based: Exit 100% of position if target not hit within 2 hours
 
 - **Stop Loss:**
   - Technical: Below breakout level (failed breakout) - usually 0.5-1% below entry
+  - **HARD STOP:** -0.75% maximum loss - auto-close immediately (current AVAX positions violated this)
   - Time-based: If price doesn't move within 30 minutes, exit (dead setup)
   - Momentum loss: If RSI drops below 50 after entry, momentum died
 
 - **Trailing Method:**
   - Once 1x ATR in profit, move stop to breakeven
   - Trail at 0.5x ATR behind price (aggressive trailing)
-  - Takes 50% profit at 1x ATR, lets 50% ride to 1.5x ATR
-  - Never holds overnight (80%+ of positions closed daily)
+  - **MANDATORY:** Takes 50% profit at 1x ATR, lets 50% ride to 1.5x ATR
+  - **ABSOLUTE RULE:** Never holds positions overnight (80%+ of positions closed daily)
+  - **MAX HOLD TIME:** 4 hours absolute maximum (current positions held 24+ hours = violation)
 
 ### Risk Management
 
-- **Position Sizing:** Fixed dollar risk per trade (2-3% of account per trade, adjusted based on ATR for position size)
+- **Position Sizing:** Fixed dollar risk per trade (1.5-2% of account per trade, reduced from 2-3%)
 - **Portfolio Allocation:** Single pair focus at a time (all-in on best setup, not diversified)
+- **Position Limits:** MAXIMUM 1 position per asset (no duplicate positions like current 2 AVAX trades)
+- **Total Open Positions:** Maximum 2 positions simultaneously (current 3 positions too many)
 - **Risk/Reward Ratio:** Minimum 1.5:1, typically 2:1 due to tight stops
+- **Daily Loss Limit:** Stop trading if -3% daily loss hit (prevents tilt trading)
 
 ### Special Tactics
 
@@ -184,6 +209,7 @@
 - Can get trapped in fakeouts (aggressive entry sometimes wrong)
 - High stress lifestyle (burnout risk, emotional toll)
 - Large drawdowns when wrong (leverage amplifies mistakes)
+- **CRITICAL (Feb 2026):** Breakdown in discipline - holds losers overnight, ignores stops, violates all time rules, lets winners run too long (greed), takes duplicate positions (concentration risk), goes long-only despite claiming to be direction-agnostic. This is NOT a strategy problem - the strategy works when followed. This is an EXECUTION problem requiring return to mechanical rule-following.
 
 ### Psychological Approach
 
@@ -225,6 +251,40 @@
 
 **Lessons:** Good discipline taking partial profits and moving stop to breakeven. However, trailing stop too tight for strong momentum. Should have used wider trail on remaining 50% (maybe 1x ATR trail instead of 0.5x). Overall solid trade but could have made 2x more.
 
+**February 2026 - Current Positions Analysis (Case Study in Rule Violations):**
+
+**Positions Held (All Violating Strategy Rules):**
+1. AVAXUSDT Long @ $10.233 (3x leverage) - ROI: -0.34% - Entry: 2026-02-02 23:59:43
+2. AVAXUSDT Long @ $10.233 (4x leverage) - ROI: -0.46% - Entry: 2026-02-02 23:30:02
+3. SOLUSDT Long @ $104.16 (3x leverage) - ROI: +94.47% - Entry: 2026-02-02 23:04:31
+
+**Rules Violated:**
+1. **Holding Period:** All positions held 24+ hours vs. 15min-4hr maximum (VIOLATION)
+2. **Stop Loss:** AVAX positions at -0.34% and -0.46% should have been stopped out at -0.75% (VIOLATION)
+3. **Concentration:** Two positions on same asset (AVAX) violates "one setup at a time" rule (VIOLATION)
+4. **Profit Taking:** SOL position at +94% should have taken 50% profit at 1x ATR (~+3-4%) (VIOLATION)
+5. **Overnight Holding:** All positions held overnight vs. "80%+ closed daily" rule (VIOLATION)
+6. **Time Stop:** No positions closed at 2-hour time stop (VIOLATION)
+7. **Directional Bias:** Only long positions - no shorts scanned despite claiming "opportunistic both" (VIOLATION)
+8. **Position Count:** 3 open positions vs. maximum 2 allowed (VIOLATION)
+
+**Cost of Violations:**
+- Unrealized loss on AVAX positions: ~$156 (should have been closed at stop loss)
+- Opportunity cost: Capital tied up in losing AVAX positions could be deployed to new setups
+- Greed tax on SOL: Unrealized +94% means position should have been 50% closed hours ago - one reversal wipes all gains
+
+**Root Cause:** Complete breakdown of discipline. Trader stopped following mechanical rules and started "trading based on feelings." The strategy itself is sound - it works when rules are followed. Current -24% drawdown is entirely self-inflicted through lack of execution discipline.
+
+**Required Actions:**
+1. IMMEDIATE: Close AVAX positions at market (cut losses)
+2. IMMEDIATE: Take 50% profit on SOL position (lock in gains)
+3. Set mechanical stops at -0.75% on all future positions (auto-close)
+4. Set 2-hour time stop on all positions (auto-close)
+5. Set 4-hour absolute maximum hold time (auto-close)
+6. Limit to maximum 1 position per asset
+7. Limit to maximum 2 positions total
+8. Scan for both long AND short setups every trading session
+
 ## Performance Notes
 
 **Historical Performance (2021-2025):**
@@ -234,19 +294,48 @@
 - 2024: +195% (strong volatility, excellent year)
 - 2025 YTD: +18% (first two months, choppy start)
 
+**Current Performance (February 2026):**
+- **Live Account P&L:** -24.11% (-$2,410.94 from $10,000)
+- **Critical Issues Identified:**
+  - No closed positions (100% capital tied up in open trades)
+  - Violated holding period rules (positions open 24+ hours vs. 15min-4hr target)
+  - Duplicate positions on same asset (2 AVAX positions - violates concentration rules)
+  - No stop loss execution (AVAX positions showing -0.34% and -0.46% should be closed)
+  - Long-only bias (no short positions despite claiming to be direction-agnostic)
+  - Unrealized profit on SOL (+94%) not taken (violates 50% profit taking rule)
+
+**Root Cause Analysis:**
+1. **Strategy Drift:** Not following own rules (holding too long, no stops)
+2. **Confirmation Bias:** Only going long despite claiming "opportunistic both directions"
+3. **Poor Execution:** "Expert" profile but behavior is novice (holding losers)
+4. **Greed:** Holding SOL for +94% when strategy says take 50% at 1x ATR
+5. **Lack of Discipline:** Multiple positions on same asset violates risk management
+
+**Optimizations Applied (February 2026):**
+- Reduced max leverage from 3-5x to 2-3x maximum
+- Reduced capital allocation from 15-25% to 10-15% per trade
+- Reduced max drawdown limit from 35% to 20%
+- Added HARD stop loss at -0.75% (auto-close)
+- Added MAX hold time of 4 hours absolute
+- Added position limit: MAX 1 position per asset
+- Added total open positions limit: MAX 2 simultaneously
+- Added daily loss limit: Stop trading at -3% daily
+- MANDATED 50% profit taking at 1x ATR (no exceptions)
+- ENFORCED overnight closing rule
+
 **Win Rate:** 52% (low win rate, but winners are 2x larger than losers)
 
-**Average Hold Time:** 47 minutes
+**Average Hold Time:** 47 minutes (historical) - Current positions: 24+ hours (VIOLATION)
 
 **Average Monthly Trades:** ~380 trades/month
 
-**Maximum Drawdown:** -42% (May 2022, during Terra collapse - got caught in wrong direction)
+**Maximum Drawdown:** -42% (May 2022) | **Current Drawdown:** -24% (February 2026 - ACTIVE)
 
 **Best Month:** +65% (November 2024, volatility explosion)
 
 **Worst Month:** -28% (June 2022, low volatility, overtrading)
 
-**Style Notes:** Classic "high risk, high reward" trader. Makes money in bursts when volatility is high and trends are strong. Struggles in choppy, range-bound markets. Would be profitable overall but suffers from large drawdowns during regime changes. Needs volatility screening to avoid forcing trades in dead markets.
+**Style Notes:** Classic "high risk, high reward" trader. Makes money in bursts when volatility is high and trends are strong. Struggles in choppy, range-bound markets. **CRITICAL ISSUE:** Current performance shows complete breakdown of discipline - holding losers overnight, no stop execution, duplicate positions, profit-taking violations. Trader needs to return to basics: mechanical rule enforcement, smaller size, strict time stops. The strategy works when rules are followed; current drawdown is entirely self-inflicted through lack of discipline.
 
 ## Metadata
 

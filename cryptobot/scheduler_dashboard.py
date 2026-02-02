@@ -18,12 +18,15 @@ from rich.layout import Layout
 
 
 class LogEntry:
-    """A single log entry"""
+    """A single log entry with support for detailed multi-line content"""
 
-    def __init__(self, message: str, level: str = "info", timestamp: datetime = None):
+    def __init__(self, message: str, level: str = "info", timestamp: datetime = None,
+                 detail_lines: List[str] = None, trader_id: str = None):
         self.message = message
-        self.level = level  # info, warning, error, success
+        self.level = level  # info, warning, error, success, decide, optimize, trigger, thinking
         self.timestamp = timestamp or datetime.now()
+        self.detail_lines = detail_lines or []  # Additional detail lines for complex entries
+        self.trader_id = trader_id  # Optional trader ID for filtering
 
     def to_rich_text(self) -> Text:
         """Convert to Rich Text with styling"""
@@ -36,7 +39,10 @@ class LogEntry:
             "success": "green",
             "decide": "bold blue",
             "optimize": "bold magenta",
-            "trigger": "dim yellow"
+            "trigger": "dim yellow",
+            "thinking": "dim white",
+            "indicator": "cyan",
+            "analysis": "blue"
         }
 
         style = style_map.get(self.level, "white")
@@ -45,6 +51,19 @@ class LogEntry:
         text = Text()
         text.append(f"[{time_str}] ", style="dim")
         text.append(self.message, style=style)
+
+        # Add detail lines with indentation
+        for line in self.detail_lines:
+            text.append("\n    ")
+            # Use different styling for different types of details
+            if line.startswith("•") or line.startswith("-"):
+                text.append(line, style="dim")
+            elif ":" in line and not line.startswith(" "):
+                # Field-style lines (e.g., "RSI: 45.2")
+                text.append(line, style="cyan")
+            else:
+                text.append(line, style="dim white")
+
         return text
 
 
@@ -107,14 +126,114 @@ class SchedulerDashboard:
             if trader_id not in self.last_optimize_times:
                 self.last_optimize_times[trader_id] = None
 
-    def log(self, message: str, level: str = "info"):
+    def log(self, message: str, level: str = "info", detail_lines: List[str] = None, trader_id: str = None):
         """Add a log entry
 
         Args:
             message: Log message
-            level: Log level (info, warning, error, success, decide, optimize, trigger)
+            level: Log level (info, warning, error, success, decide, optimize, trigger, thinking)
+            detail_lines: Optional list of detail lines to display
+            trader_id: Optional trader ID for filtering
         """
-        self.logs.append(LogEntry(message, level))
+        self.logs.append(LogEntry(message, level, detail_lines=detail_lines, trader_id=trader_id))
+
+    def log_decision_start(self, trader_id: str, trigger_type: str = "manual"):
+        """Log the start of a decision process
+
+        Args:
+            trader_id: Trader ID
+            trigger_type: What triggered this decision (manual, scheduler, trigger)
+        """
+        self.log(f"{trader_id} deciding...", "decide", trader_id=trader_id)
+
+    def log_decision_thinking(self, trader_id: str, phase1_thinking: str = None,
+                             phase2_thinking: str = None, indicator_data: Dict = None,
+                             market_context: Dict = None):
+        """Log detailed decision thinking process
+
+        Args:
+            trader_id: Trader ID
+            phase1_thinking: Phase 1 thinking (initial analysis)
+            phase2_thinking: Phase 2 thinking (final decision analysis)
+            indicator_data: Technical indicators used
+            market_context: Market context data
+        """
+        detail_lines = []
+
+        # Add indicators summary
+        if indicator_data:
+            detail_lines.append("[cyan]Indicators:[/cyan]")
+            for key, value in indicator_data.items():
+                if isinstance(value, dict):
+                    # Handle nested indicator data
+                    value_str = ", ".join(f"{k}: {v}" for k, v in value.items())
+                    detail_lines.append(f"  • {key}: {value_str}")
+                else:
+                    detail_lines.append(f"  • {key}: {value}")
+
+        # Add market context summary
+        if market_context:
+            if 'price' in market_context:
+                detail_lines.append(f"[cyan]Price:[/cyan] ${market_context.get('price', 'N/A')}")
+            if 'volume_24h' in market_context:
+                detail_lines.append(f"[cyan]Volume (24h):[/cyan] ${market_context.get('volume_24h', 'N/A')}")
+
+        # Add phase 1 thinking (truncated for readability)
+        if phase1_thinking:
+            thinking_preview = self._truncate_text(phase1_thinking, max_lines=3, max_chars=200)
+            detail_lines.append(f"[blue]Initial Analysis:[/blue]")
+            detail_lines.append(f"  {thinking_preview}")
+
+        # Add phase 2 thinking (truncated for readability)
+        if phase2_thinking:
+            thinking_preview = self._truncate_text(phase2_thinking, max_lines=3, max_chars=200)
+            detail_lines.append(f"[blue]Decision Analysis:[/blue]")
+            detail_lines.append(f"  {thinking_preview}")
+
+        if detail_lines:
+            self.log(f"{trader_id} AI thinking process", "thinking", detail_lines=detail_lines, trader_id=trader_id)
+
+    def log_decision_complete(self, trader_id: str, decision: str, phase1_thinking: str = None,
+                             phase2_thinking: str = None):
+        """Log the completion of a decision
+
+        Args:
+            trader_id: Trader ID
+            decision: The final decision
+            phase1_thinking: Phase 1 thinking (for summary)
+            phase2_thinking: Phase 2 thinking (for summary)
+        """
+        self.log(f"{trader_id} decision complete: {decision}", "success", trader_id=trader_id)
+
+    def _truncate_text(self, text: str, max_lines: int = 3, max_chars: int = 200) -> str:
+        """Truncate text to specified limits
+
+        Args:
+            text: Text to truncate
+            max_lines: Maximum number of lines
+            max_chars: Maximum number of characters
+
+        Returns:
+            Truncated text with ellipsis if needed
+        """
+        if not text:
+            return ""
+
+        # Split into lines
+        lines = text.split('\n')
+
+        # Take first N lines
+        truncated = '\n'.join(lines[:max_lines])
+
+        # Truncate by character count if still too long
+        if len(truncated) > max_chars:
+            truncated = truncated[:max_chars] + "..."
+
+        # Add ellipsis if we truncated lines
+        if len(lines) > max_lines:
+            truncated = truncated.rstrip() + "\n  ..."
+
+        return truncated.strip()
 
     def update_decision_result(self, trader_id: str, result: str, action: str):
         """Update the last decision result for a trader

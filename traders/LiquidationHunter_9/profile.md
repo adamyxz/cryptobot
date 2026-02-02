@@ -122,6 +122,19 @@
 - **Social Sentiment:** `Twitter/X` (monitor for euphoria/panic extremes at bottoms/tops)
 - **Technical Analysis:** TradingView (chart patterns, RSI, MACD, volume)
 
+## Required Data Sources
+
+**Strategy Keywords:** `price_action, funding_rate, liquidation, open_interest, sentiment`
+
+This trader requires the following indicators for decision-making:
+- **market_data** - OHLCV for price action analysis and RSI calculations
+- **fundingratehistory** - Core indicator for identifying crowded positions
+- **fetch_orderbook** - Order book depth for identifying liquidation walls
+- **fetch_open_interest** - OI spikes indicate leverage buildup
+- **longshortratio** - Retail positioning extremes
+
+These indicators will be automatically fetched before each decision based on these keywords.
+
 ## Edge and Philosophy
 
 ### Trading Edge

@@ -282,26 +282,44 @@ class TraderScheduler:
             trigger_type = metadata.get('trigger', 'unknown')
 
             if action == 'decide':
-                # Log to dashboard
-                self.dashboard.log(f"{trader_id} deciding...", "decide")
+                # Log to dashboard with detailed thinking
+                self.dashboard.log_decision_start(trader_id, trigger_type)
 
                 # Update dashboard task tracking
                 self.dashboard.update_scheduler_tasks(self.tasks)
 
-                # Execute decision (will be implemented with DecisionEngine)
-                decision_summary = await self._execute_decision(trader_id, metadata)
+                # Execute decision and get detailed info
+                decision_info = await self._execute_decision(trader_id, metadata)
 
                 # Update tracking
                 self.tasks[trader_id]['last_decide'] = datetime.now()
 
+                # Log detailed thinking if available
+                if decision_info.get('thinking'):
+                    self.dashboard.log_decision_thinking(
+                        trader_id,
+                        phase1_thinking=decision_info.get('phase1_thinking'),
+                        phase2_thinking=decision_info.get('phase2_thinking'),
+                        indicator_data=decision_info.get('indicator_data'),
+                        market_context=decision_info.get('market_context')
+                    )
+
+                # Extract decision summary
+                decision_summary = decision_info.get('summary', 'unknown')
+
                 # Update dashboard with decision result
                 self.dashboard.update_decision_result(trader_id, decision_summary, "decide")
 
-                # Log based on result
+                # Log completion
                 if "failed" in decision_summary.lower() or "error" in decision_summary.lower():
                     self.dashboard.log(f"{trader_id} decision failed: {decision_summary}", "error")
                 else:
-                    self.dashboard.log(f"{trader_id} decision complete: {decision_summary}", "success")
+                    self.dashboard.log_decision_complete(
+                        trader_id,
+                        decision_summary,
+                        phase1_thinking=decision_info.get('phase1_thinking'),
+                        phase2_thinking=decision_info.get('phase2_thinking')
+                    )
 
             elif action == 'optimize':
                 # Log to dashboard
@@ -329,7 +347,7 @@ class TraderScheduler:
             # Update dashboard task tracking
             self.dashboard.update_scheduler_tasks(self.tasks)
 
-    async def _execute_decision(self, trader_id: str, metadata: Dict[str, Any]) -> str:
+    async def _execute_decision(self, trader_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a decision for a trader
 
         Args:
@@ -337,39 +355,21 @@ class TraderScheduler:
             metadata: Task metadata
 
         Returns:
-            Decision result string
+            Dictionary with decision information including:
+            - summary: Brief decision summary (e.g., "open BTCUSDT long")
+            - thinking: Boolean indicating if thinking is available
+            - phase1_thinking: Phase 1 thinking content
+            - phase2_thinking: Phase 2 thinking content
+            - indicator_data: Technical indicators used
+            - market_context: Market context data
         """
         # Call CryptoBot's existing decision method with verbose=False
-        decision_result = await self.cryptobot._execute_decision_process(trader_id, verbose=False)
+        # The method returns a dict with detailed information
+        decision_info = await self.cryptobot._execute_decision_process(
+            trader_id, verbose=False, trigger_source="scheduler"
+        )
 
-        # Parse decision for display
-        if decision_result and decision_result != "ERROR":
-            parts = decision_result.split()
-            action = parts[0] if parts else "UNKNOWN"
-
-            # Format decision summary
-            if action == "OPEN_LONG":
-                if len(parts) >= 4:
-                    summary = f"open {parts[2]} long"
-                else:
-                    summary = f"open long"
-            elif action == "OPEN_SHORT":
-                if len(parts) >= 4:
-                    summary = f"open {parts[2]} short"
-                else:
-                    summary = f"open short"
-            elif action == "CLOSE_POSITION":
-                summary = f"close #{parts[1] if len(parts) > 1 else ''}"
-            elif action == "CLOSE_ALL":
-                summary = "close all"
-            elif action == "HOLD":
-                summary = "hold"
-            else:
-                summary = action
-        else:
-            summary = "decision failed" if decision_result == "ERROR" else "unknown"
-
-        return summary
+        return decision_info
 
     async def _execute_optimization(self, trader_id: str):
         """Execute an optimization for a trader

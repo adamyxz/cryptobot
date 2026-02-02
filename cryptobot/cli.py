@@ -31,6 +31,7 @@ from .position_db import PositionDatabase
 from .position import Position, PositionSide, PositionStatus
 from .fees import calculate_fee
 from .price_service import get_price_service
+from .activity_log_db import ActivityLogDatabase
 
 
 def is_interactive_terminal() -> bool:
@@ -322,6 +323,28 @@ class CryptoBot:
     /config                    # Show all configuration
     /config scheduler.check_interval 60  # Set check interval
     /config reset             # Reset configuration
+
+[bold yellow]/logs [decision|optimization|stats] [trader_id] [limit] [--thinking][/bold yellow]
+  View activity logs (decisions and optimizations)
+
+  [dim]Subcommands:[/dim]
+    decision     - Show decision logs
+    optimization - Show optimization logs
+    stats        - Show activity statistics
+
+  [dim]Parameters:[/dim]
+    trader_id   - Filter by trader ID (optional)
+    limit       - Number of logs to show (default: 20)
+    --thinking  - Show AI's detailed thinking process (decision only)
+    --detail    - Show full log details
+
+  [dim]Examples:[/dim]
+    /logs decision              # Show recent decision logs
+    /logs decision 1            # Show decision logs for trader 1
+    /logs decision 1 --thinking # Show with AI thinking process
+    /logs optimization 1 50     # Show 50 optimization logs for trader 1
+    /logs stats                 # Show overall statistics
+    /logs stats 1               # Show statistics for trader 1
 
 
 [dim]════════════════════════════════════════════════════════════════════════════════════════
@@ -2390,16 +2413,42 @@ If test files are created during testing, clean them up after tests pass."""
         # Execute decision (wait for completion by default for better UX)
         await self._execute_decision_process(trader_id, verbose=True)
 
-    async def _execute_decision_process(self, trader_id: str, verbose: bool = True):
+    async def _execute_decision_process(self, trader_id: str, verbose: bool = True, trigger_source: str = "manual"):
         """Execute the full decision workflow
 
         Args:
             trader_id:Trader ID
+            verbose: Whether to print verbose output
+            trigger_source: What triggered this decision (manual, scheduler, trigger)
         """
         import os
         import json
+        import time
         import tempfile
         from pathlib import Path
+
+        # Initialize activity log database
+        log_db = ActivityLogDatabase()
+        log_db.initialize()
+
+        # Track execution time
+        start_time = time.time()
+
+        # Initialize logging data
+        log_data = {
+            'trader_id': trader_id,
+            'trigger_source': trigger_source,
+            'status': 'SUCCESS',
+            'error_message': None,
+            'execution_time_ms': None,
+            'phase1_prompt': None,
+            'phase1_response': None,
+            'phase2_prompt': None,
+            'final_decision': None,
+            'indicator_data': None,
+            'market_context': None,
+            'positions_context': None,
+        }
 
         try:
             # Phase 1: Gather data
@@ -2444,111 +2493,353 @@ If test files are created during testing, clean them up after tests pass."""
             # Build decision context
             decision_context = self._build_decision_context(trader, open_positions, summary, profile_content)
 
-            # Phase 2: AI initial assessment
+            # Store positions context for logging
+            log_data['positions_context'] = {
+                'open_positions': [self._position_to_dict(p) for p in open_positions],
+                'summary': summary
+            }
+
+            # Phase 2: Auto-fetch indicators based on trader profile (Code-level certainty)
             if verbose:
-                self.console.print("[Phase 2] AI initialstepanalyzein...")
+                self.console.print("[Phase 2] Auto-fetching market data based on trader profile...")
+            indicator_data = await self._auto_fetch_indicators(trader, verbose=verbose)
+
+            if verbose and indicator_data:
+                self.console.print(f"[completed] auto-fetched {len(indicator_data)} indicator(s): {list(indicator_data.keys())}")
+
+            log_data['indicator_data'] = indicator_data
+            log_data['market_context'] = decision_context.get('market_data', {})
+
+            # Phase 3: AI initial assessment (now with auto-fetched data available)
+            if verbose:
+                self.console.print("[Phase 3] AI initial analysis...")
             phase1_prompt = self._build_phase1_prompt(decision_context)
             phase1_response = await self._call_claude_code_for_decision(phase1_prompt, trader_id)
 
+            log_data['phase1_prompt'] = phase1_prompt
+            log_data['phase1_response'] = phase1_response
+
             if not phase1_response or phase1_response.startswith("ERROR"):
                 self.console.print(f"[Error] AI callingfailed: {phase1_response}")
-                return "ERROR"
+                log_data['status'] = 'ERROR'
+                log_data['error_message'] = phase1_response
+                log_data['execution_time_ms'] = (time.time() - start_time) * 1000
+                log_db.log_decision(**log_data)
+                return {
+                    'summary': "ERROR",
+                    'thinking': False,
+                    'phase1_thinking': None,
+                    'phase2_thinking': None,
+                    'indicator_data': log_data.get('indicator_data'),
+                    'market_context': log_data.get('market_context'),
+                    'positions_context': log_data.get('positions_context'),
+                    'error': phase1_response
+                }
+
+            # Parse phase1 response to extract thinking and decision
+            phase1_thinking, phase1_decision = self._parse_ai_response(phase1_response)
+            log_data['phase1_thinking'] = phase1_thinking
 
             # Show brief summary of AI response
             if verbose:
-                response_lines = phase1_response.strip().split('\n')
-                first_line = response_lines[0] if response_lines else phase1_response[:100]
-                self.console.print(f"[AI response] {first_line}")
+                if phase1_thinking:
+                    # Show first few lines of thinking
+                    thinking_lines = phase1_thinking.split('\n')[:3]
+                    self.console.print(f"[AI thinking] {' '.join(thinking_lines)[:150]}...")
+                decision_preview = phase1_decision if phase1_decision else (phase1_response[:100] if phase1_response else '')
+                self.console.print(f"[AI decision] {decision_preview}")
 
-            # Phase 3: Execute indicators if needed
-            indicator_data = {}
+            # Phase 4: Fetch additional indicators if AI explicitly requests them
             response_upper = phase1_response.upper()
-
-            if "NEED_ORDERBOOK" in response_upper or "NEED_MARKET" in response_upper or "NEED_BOTH" in response_upper:
+            if "NEED_INDICATOR" in response_upper or "NEED_ORDERBOOK" in response_upper or "NEED_MARKET" in response_upper or "NEED_BOTH" in response_upper:
                 if verbose:
-                    self.console.print("[Phase 3] collectamountexternalmarketdata...")
-                indicator_data = await self._execute_indicators_from_response(phase1_response, trader)
+                    self.console.print("[Phase 4] Fetching additional requested data...")
+                additional_data = await self._execute_indicators_from_response(phase1_response, trader)
 
-                if verbose and indicator_data:
-                    self.console.print(f"[completed] has beencollectindicatordata: {list(indicator_data.keys())}")
+                if verbose and additional_data:
+                    self.console.print(f"[completed] fetched {len(additional_data)} additional indicator(s): {list(additional_data.keys())}")
 
-            # Phase 4: Final decision
+                # Merge with existing indicator data
+                indicator_data.update(additional_data)
+                log_data['indicator_data'] = indicator_data
+
+            # Phase 5: Final decision
             if verbose:
-                self.console.print("[Phase 4] make finaldecision...")
+                self.console.print("[Phase 5] Making final decision...")
             phase2_prompt = self._build_phase2_prompt(decision_context, indicator_data, phase1_response)
-            final_decision = await self._call_claude_code_for_decision(phase2_prompt, trader_id)
+            phase2_response = await self._call_claude_code_for_decision(phase2_prompt, trader_id)
 
-            if not final_decision or final_decision.startswith("ERROR"):
-                self.console.print(f"[Error] finaldecisionfailed: {final_decision}")
-                return "ERROR"
+            log_data['phase2_prompt'] = phase2_prompt
+            log_data['phase2_response'] = phase2_response
 
-            # Extract decision from response - look for valid action keywords
-            decision_lines = final_decision.strip().split('\n')
-            actual_decision = None
+            if not phase2_response or phase2_response.startswith("ERROR"):
+                self.console.print(f"[Error] finaldecisionfailed: {phase2_response}")
+                log_data['status'] = 'ERROR'
+                log_data['error_message'] = phase2_response
+                log_data['execution_time_ms'] = (time.time() - start_time) * 1000
+                log_db.log_decision(**log_data)
+                return {
+                    'summary': "ERROR",
+                    'thinking': False,
+                    'phase1_thinking': log_data.get('phase1_thinking'),
+                    'phase2_thinking': None,
+                    'indicator_data': log_data.get('indicator_data'),
+                    'market_context': log_data.get('market_context'),
+                    'positions_context': log_data.get('positions_context'),
+                    'error': phase2_response
+                }
 
-            # Valid action keywords (prioritize longer actions first to avoid partial matches)
-            valid_actions = ['CLOSE_POSITION', 'OPEN_LONG', 'OPEN_SHORT', 'CLOSE_ALL', 'HOLD']
+            # Parse phase2 response to extract thinking and action code
+            phase2_thinking, phase2_action_code = self._parse_ai_response(phase2_response)
+            log_data['phase2_thinking'] = phase2_thinking
 
-            # Find the line containing a valid action
-            for line in decision_lines:
-                line_upper = line.upper().strip()
-                # Check if any valid action appears in this line (as a standalone word)
-                for action in valid_actions:
-                    # Use word boundaries to match standalone actions
-                    pattern = r'\b' + action + r'\b'
-                    if re.search(pattern, line_upper):
-                        # Extract the portion starting from the action
-                        match = re.search(pattern + r'.*', line_upper)
-                        if match:
-                            actual_decision = match.group(0).strip()
-                            # Convert back to original case for parameters
-                            action_idx = line.upper().find(action)
-                            actual_decision = line[action_idx:].strip()
-                        break
-                if actual_decision:
-                    break
+            # Show thinking process in verbose mode
+            if verbose and phase2_thinking:
+                self.console.print(f"[AI analysis]\n{phase2_thinking[:500]}...")
 
-            # If still no valid action, try searching in the entire response
-            if not actual_decision:
-                response_upper = final_decision.upper()
-                for action in valid_actions:
-                    # Look for the action as a standalone word
-                    pattern = r'\b' + action + r'\b'
-                    if re.search(pattern, response_upper):
-                        # Find the original line
-                        for line in decision_lines:
-                            if action in line.upper():
-                                action_idx = line.upper().find(action)
-                                actual_decision = line[action_idx:].strip()
-                                break
-                        if not actual_decision:
-                            actual_decision = action
-                        break
+            # Debug: show parsed action code
+            if verbose:
+                self.console.print(f"[debug] Parsed action code:\n{phase2_action_code if phase2_action_code else 'None'}")
 
-            # Final fallback: if no valid action found, default to HOLD
-            if not actual_decision:
+            # Execute the action code
+            actual_decision = "HOLD"
+            action_result = None
+
+            if phase2_action_code:
                 if verbose:
-                    self.console.print(f"[Warning] Cannotparsedecision，defaultas HOLD")
-                    self.console.print(f"[debug] AI response: {final_decision[:200]}")
+                    self.console.print("[executing] AI action code...")
+
+                action_result = await self._execute_action_code(phase2_action_code, trader_id)
+
+                if action_result['success']:
+                    if verbose:
+                        self.console.print(f"[green]✓ Action executed successfully[/green]")
+                        if action_result['output']:
+                            self.console.print(f"  [dim]{action_result['output']}[/dim]")
+
+                    # Extract summary from result
+                    if action_result['result']:
+                        if hasattr(action_result['result'], 'message'):
+                            actual_decision = action_result['result'].message
+                        elif isinstance(action_result['result'], dict):
+                            actual_decision = action_result['result'].get('message', 'Executed')
+                        else:
+                            actual_decision = str(action_result['result'])
+                else:
+                    self.console.print(f"[red]✗ Action execution failed: {action_result['error']}[/red]")
+                    if verbose:
+                        self.console.print(f"[debug] Traceback:\n{action_result.get('traceback', 'N/A')}")
+                    actual_decision = f"ERROR: {action_result['error']}"
+            else:
+                # No action code found - default to hold
+                if verbose:
+                    self.console.print("[yellow] No action code found in response, defaulting to HOLD[/yellow]")
                 actual_decision = "HOLD"
 
-            if verbose:
-                self.console.print(f"[AI decision] {actual_decision}")
+            log_data['final_decision'] = actual_decision
 
-            # Phase 5: Execute decision
-            await self._execute_decision(actual_decision, trader_id)
             if verbose:
-                self.console.print("[completed] decisionflowprocessend")
+                self.console.print(f"[AI decision result] {actual_decision}")
 
-            # Return the decision for dashboard tracking
-            return actual_decision
+            if verbose:
+                self.console.print("[completed] decision flow process end")
+
+            # Calculate execution time and log
+            log_data['execution_time_ms'] = (time.time() - start_time) * 1000
+            log_db.log_decision(**log_data)
+
+            # Return detailed decision info for dashboard tracking
+            return {
+                'summary': actual_decision,
+                'thinking': True,
+                'phase1_thinking': log_data.get('phase1_thinking'),
+                'phase2_thinking': log_data.get('phase2_thinking'),
+                'indicator_data': log_data.get('indicator_data'),
+                'market_context': log_data.get('market_context'),
+                'positions_context': log_data.get('positions_context'),
+                'action_result': action_result
+            }
 
         except Exception as e:
             self.console.print(f"[Error] decisionprocessError: {e}")
             import traceback
             if verbose:
                 self.console.print(f"[debug] {traceback.format_exc()}")
-            return "ERROR"
+
+            # Log error
+            log_data['status'] = 'ERROR'
+            log_data['error_message'] = str(e)
+            log_data['execution_time_ms'] = (time.time() - start_time) * 1000
+            try:
+                log_db.log_decision(**log_data)
+            except Exception:
+                pass  # Don't fail if logging fails
+
+            # Return error info
+            return {
+                'summary': "ERROR",
+                'thinking': False,
+                'phase1_thinking': None,
+                'phase2_thinking': None,
+                'indicator_data': None,
+                'market_context': None,
+                'positions_context': None,
+                'error': str(e)
+            }
+
+    def _parse_ai_response(self, response: str) -> tuple:
+        """Parse AI response to extract thinking process and action code
+
+        Args:
+            response: AI response string
+
+        Returns:
+            Tuple of (thinking, action_code) where:
+            - thinking: The thinking process (or None if not found)
+            - action_code: Python code to execute (or None if not found)
+        """
+        if not response:
+            return None, None
+
+        thinking = None
+        action_code = None
+
+        # Try to extract THINKING section
+        thinking_match = re.search(r'\*\*THINKING:\*\*\s*(.*?)(?=\*\*ACTION:\*\*|$)', response, re.DOTALL | re.IGNORECASE)
+        if thinking_match:
+            thinking = thinking_match.group(1).strip()
+        else:
+            # Try alternate formats
+            thinking_match = re.search(r'THINKING:\s*(.*?)(?=ACTION:|$)', response, re.DOTALL | re.IGNORECASE)
+            if thinking_match:
+                thinking = thinking_match.group(1).strip()
+
+        # Try to extract ACTION code block
+        # Look for ```python code blocks
+        code_match = re.search(r'```python\s*(.*?)```', response, re.DOTALL | re.IGNORECASE)
+        if code_match:
+            action_code = code_match.group(1).strip()
+        else:
+            # Try to find ACTION section without code block
+            action_match = re.search(r'\*\*ACTION:\*\*\s*(.*?)(?=\*\*ACTION RESULT:|\*\*THINKING:|$)', response, re.DOTALL | re.IGNORECASE)
+            if action_match:
+                action_text = action_match.group(1).strip()
+                # Remove ```python or ``` markers if present
+                action_text = re.sub(r'```python|```', '', action_text, flags=re.IGNORECASE).strip()
+                action_code = action_text
+
+        # If still no thinking section, look for content before the action
+        if not thinking and action_code:
+            # Remove the action part and see what's left
+            content_before = response.replace(action_code, '').strip()
+            if content_before and len(content_before) > 50:  # Only if substantial content
+                thinking = content_before
+
+        return thinking, action_code
+
+    async def _execute_action_code(self, code: str, trader_id: str) -> dict:
+        """Execute Python code from AI response
+
+        Args:
+            code: Python code string to execute
+            trader_id: Trader ID for context
+
+        Returns:
+            Dict with execution result
+        """
+        from .trading_tools import TradingTools
+        from .trader_db import TraderDatabase
+        from .position_db import PositionDatabase
+
+        # Initialize databases
+        trader_db = TraderDatabase()
+        trader_db.initialize()
+        pos_db = PositionDatabase()
+        pos_db.initialize()
+
+        # Create trading tools instance
+        tools = TradingTools(self.console, pos_db, trader_db)
+
+        # Prepare execution context
+        exec_globals = {
+            'open_position': tools.open_position,
+            'close_position': tools.close_position,
+            'close_all_positions': tools.close_all_positions,
+            'hold': tools.hold,
+            'trader_id': trader_id,
+            '__builtins__': {
+                'print': print,
+                'len': len,
+                'str': str,
+                'int': int,
+                'float': float,
+                'bool': bool,
+                'list': list,
+                'dict': dict,
+                'range': range,
+                'locals': locals,
+            }
+        }
+
+        # Capture output
+        import io
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = captured_output = io.StringIO()
+
+        try:
+            # Check if code contains async operations
+            code_stripped = code.strip()
+            is_async = 'await' in code or 'async def' in code
+
+            if is_async:
+                # Wrap async code in an async function
+                wrapped_code = f'''
+async def _ai_generated_code():
+{chr(10).join("    " + line for line in code.split(chr(10)))}
+    return locals()
+'''
+                # Define the async function
+                exec(wrapped_code, exec_globals)
+
+                # Execute the async function and await it
+                ai_func = exec_globals.get('_ai_generated_code')
+                if ai_func:
+                    result_vars = await ai_func()
+                    result = result_vars.get('result', None)
+                else:
+                    raise RuntimeError("Failed to create async function")
+            else:
+                # Execute synchronous code normally
+                exec(code, exec_globals)
+                result = exec_globals.get('result', None)
+
+            # Get any printed output
+            output = captured_output.getvalue()
+
+            return {
+                'success': True,
+                'code': code,
+                'output': output,
+                'result': result,
+                'error': None
+            }
+
+        except Exception as e:
+            import traceback
+            return {
+                'success': False,
+                'code': code,
+                'output': captured_output.getvalue(),
+                'result': None,
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            }
+
+        finally:
+            sys.stdout = old_stdout
+            trader_db.close()
+            pos_db.close()
 
     def _build_decision_context(self, trader, open_positions, summary, profile_content):
         """Build decision context dict
@@ -2610,6 +2901,221 @@ If test files are created during testing, clean them up after tests pass."""
                 'roi': getattr(position, 'roi', 0)
             }
 
+    def _get_required_indicators_for_trader(self, trader):
+        """Automatically determine required indicators based on trader profile
+
+        Args:
+            trader: Trader database record
+
+        Returns:
+            Dictionary mapping indicator script names to their arguments
+            {
+                'market_data.py': {'exchange': 'binance', 'symbol': 'BTCUSDT', 'interval': '1h'},
+                'fundingratehistory.py': {'exchange': 'binance', 'symbol': 'BTCUSDT'},
+                ...
+            }
+        """
+        import json
+        import re
+
+        # Strategy keyword to indicator mapping
+        STRATEGY_KEYWORD_MAP = {
+            # Price action related
+            'price_action': 'market_data.py',
+            'ohlcv': 'market_data.py',
+            'trend': 'market_data.py',
+            'momentum': 'market_data.py',
+            'candles': 'market_data.py',
+            'klines': 'market_data.py',
+
+            # Funding rate related
+            'funding_rate': 'fundingratehistory.py',
+            'funding': 'fundingratehistory.py',
+            'futures': 'fundingratehistory.py',
+
+            # Order book related
+            'orderbook': 'fetch_orderbook.py',
+            'order_flow': 'fetch_orderbook.py',
+            'liquidity': 'fetch_orderbook.py',
+            'depth': 'fetch_orderbook.py',
+
+            # Open interest related
+            'open_interest': 'fetch_open_interest.py',
+            'oi': 'fetch_open_interest.py',
+            'leverage': 'fetch_open_interest.py',
+
+            # Long/short ratio related
+            'long_short_ratio': 'longshortratio.py',
+            'lsr': 'longshortratio.py',
+            'sentiment': 'longshortratio.py',
+            'positioning': 'longshortratio.py',
+
+            # Combinations
+            'liquidation': ['fetch_orderbook.py', 'longshortratio.py'],
+            'squeeze': ['fetch_orderbook.py', 'fundingratehistory.py'],
+            'arbitrage': ['fetch_orderbook.py', 'fundingratehistory.py'],
+            'basis': ['fetch_orderbook.py', 'fundingratehistory.py'],
+        }
+
+        # Get trader's profile content
+        trader_file = Path(trader['trader_file'])
+        if trader_file.exists():
+            profile_content = trader_file.read_text(encoding='utf-8').lower()
+        else:
+            profile_content = ''
+
+        # Get trading pairs and normalize symbols
+        trading_pairs = json.loads(trader['trading_pairs']) if isinstance(trader.get('trading_pairs'), str) else trader.get('trading_pairs', [])
+
+        # Normalize symbols: ensure they end with USDT and clean up bad data
+        def normalize_symbol(symbol: str) -> str:
+            """Normalize trading pair symbol to proper format"""
+            if not symbol:
+                return "BTCUSDT"
+
+            # Remove whitespace
+            symbol = symbol.strip()
+
+            # Skip obvious bad data (long text, contains spaces, etc.)
+            if len(symbol) > 20 or ' ' in symbol or '(' in symbol:
+                return "BTCUSDT"
+
+            # Convert to uppercase
+            symbol = symbol.upper()
+
+            # Add USDT suffix if missing
+            if not symbol.endswith('USDT') and not symbol.endswith('USDC') and not symbol.endswith('BUSD'):
+                # Check if it's a common crypto symbol
+                common_quotes = ['USDT', 'USDC', 'BUSD', 'USD', 'EUR', 'GBP']
+                has_quote = any(symbol.endswith(q) for q in common_quotes)
+                if not has_quote:
+                    symbol = symbol + 'USDT'
+
+            return symbol
+
+        # Clean and normalize trading pairs
+        normalized_pairs = []
+        for pair in trading_pairs:
+            normalized = normalize_symbol(str(pair))
+            if normalized not in normalized_pairs:
+                normalized_pairs.append(normalized)
+
+        trading_pairs = normalized_pairs if normalized_pairs else ["BTCUSDT"]
+        default_symbol = trading_pairs[0]
+        default_exchange = "binance"
+
+        # Extract "Strategy Keywords" section if present
+        strategy_keywords = []
+        keywords_match = re.search(r'strategy keywords?:\s*(.+)', profile_content, re.MULTILINE)
+        if keywords_match:
+            keywords_str = keywords_match.group(1)
+            # Clean up markdown formatting and split by comma
+            # Remove common markdown symbols: **, *, `, `
+            keywords_str = re.sub(r'[\*\`]+', ' ', keywords_str)
+            # Split by comma and clean
+            strategy_keywords = [k.strip().lower() for k in keywords_str.split(',') if k.strip() and k.strip() not in ['', '**', '``']]
+        else:
+            # Fallback: scan entire profile for keywords
+            for keyword in STRATEGY_KEYWORD_MAP.keys():
+                if keyword.replace('_', ' ') in profile_content or keyword in profile_content:
+                    if keyword not in strategy_keywords:
+                        strategy_keywords.append(keyword)
+
+        # Deduce default interval from timeframes if available
+        default_interval = '1h'
+        timeframes = trader.get('timeframes', [])
+        if timeframes:
+            # Pick the shortest timeframe for precision
+            tf_map = {'1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d'}
+            for tf in timeframes:
+                if tf in tf_map:
+                    default_interval = tf_map[tf]
+                    break
+
+        # Build required indicators dictionary
+        required_indicators = {}
+
+        for keyword in strategy_keywords:
+            indicators = STRATEGY_KEYWORD_MAP.get(keyword, [])
+
+            # Handle single indicator
+            if isinstance(indicators, str):
+                indicators = [indicators]
+
+            # Handle list of indicators
+            for indicator_script in indicators:
+                # Skip if already added
+                if indicator_script in required_indicators:
+                    continue
+
+                # Build arguments based on script type
+                args = {
+                    'exchange': default_exchange,
+                    'symbol': default_symbol
+                }
+
+                # Add script-specific arguments
+                if indicator_script == 'market_data.py':
+                    args['interval'] = default_interval
+                elif indicator_script == 'fundingratehistory.py':
+                    args['limit'] = 100
+                elif indicator_script == 'longshortratio.py':
+                    args['period'] = '5m'
+                    args['limit'] = 100
+                elif indicator_script == 'fetch_orderbook.py':
+                    args['limit'] = 20
+
+                required_indicators[indicator_script] = args
+
+        return required_indicators
+
+    async def _auto_fetch_indicators(self, trader, verbose=True):
+        """Automatically fetch required indicators based on trader profile
+
+        Args:
+            trader: Trader database record
+            verbose: Whether to print progress messages
+
+        Returns:
+            Dictionary of indicator results (CSV strings)
+        """
+        import json
+
+        required_indicators = self._get_required_indicators_for_trader(trader)
+
+        if not required_indicators:
+            if verbose:
+                self.console.print("[dim]No indicators configured for this trader[/dim]")
+            return {}
+
+        if verbose:
+            indicator_names = [k.replace('.py', '') for k in required_indicators.keys()]
+            self.console.print(f"[Auto-fetching indicators: {', '.join(indicator_names)}]")
+
+        results = {}
+
+        for script_name, args in required_indicators.items():
+            # Build command line arguments
+            cmd_args = []
+            for key, value in args.items():
+                cmd_args.extend([f'--{key}', str(value)])
+
+            # Run the indicator
+            if verbose:
+                print(f"[indicator] running {script_name}: {' '.join(cmd_args)}")
+
+            try:
+                data = await self._run_indicator(script_name, cmd_args)
+                if data and not data.startswith("error"):
+                    results[script_name.replace('.py', '')] = data
+                elif verbose:
+                    self.console.print(f"[Warning] {script_name} failed or returned error")
+            except Exception as e:
+                if verbose:
+                    self.console.print(f"[Warning] Error running {script_name}: {e}")
+
+        return results
+
     def _build_phase1_prompt(self, context):
         """Build Phase 1 prompt for initial AI assessment
 
@@ -2628,10 +3134,24 @@ If test files are created during testing, clean them up after tests pass."""
             pos_info = f"\nCurrent positions ({len(positions['open'])}):\n"
             for p in positions['open'][:5]:  # Limit to 5 positions
                 pos_info += f"  - {p.get('symbol')} {p.get('side')} size={p.get('size')} entry={p.get('entry_price')} pnl={p.get('unrealized_pnl', 0):.2f}\n"
-            pos_info += f"\ntotalUnrealized P&L: {positions['summary'].get('total_unrealized_pnl', 0):.2f}\n"
-            pos_info += f"totalRealized P&L: {positions['summary'].get('total_realized_pnl', 0):.2f}\n"
+            pos_info += f"\ntotalUnrealized P&L: ${positions['summary'].get('total_unrealized_pnl', 0):.2f}\n"
+            pos_info += f"totalRealized P&L: ${positions['summary'].get('total_realized_pnl', 0):.2f}\n"
         else:
             pos_info = "\nCurrent positions: No\n"
+
+        # Discover all available indicators
+        indicators = self._discover_indicators()
+
+        # Format indicators list for prompt
+        indicators_text = "Available indicators (CSV format):\n"
+        for script_name, meta in indicators.items():
+            name_without_ext = script_name.replace('.py', '')
+            params_desc = ', '.join([p for p in meta['parameters'] if not p.startswith('--')])
+            if meta['output_columns']:
+                output_desc = '(' + ','.join(meta['output_columns'][:5]) + ')'
+            else:
+                output_desc = '(CSV output)'
+            indicators_text += f"- {name_without_ext}: {meta['description'][:60]} {output_desc}\n"
 
         return f"""You are a trading decision engine for trader {trader['id']}.
 
@@ -2645,19 +3165,40 @@ TRADER DATA:
 - Timeframes: {', '.join(trader['timeframes'])}
 {pos_info}
 
-TASK: Decide if additional market data is needed before making a trading decision.
+IMPORTANT: Market data relevant to your strategy has been automatically fetched based on your trader profile. You will receive this data in the next phase.
 
-Available indicators (CSV format):
-- fetch_orderbook: Order book depth (side,price,volume)
-- market_data: OHLCV with indicators (open,high,low,close,volume,rsi,trend,support,resistance)
+For now, your task is to:
+1. Analyze your trader's strategy and current position
+2. Identify if you need ADDITIONAL data beyond what will be automatically provided
+3. Make your preliminary assessment
 
-Respond with ONE of:
-- NO_DECISION_NEEDED
-- NEED_ORDERBOOK <exchange> <symbol>
-- NEED_MARKET_DATA <exchange> <symbol> <interval>
-- NEED_BOTH <exchange> <symbol> <interval>
+IMPORTANT: You MUST show your detailed thinking process before giving your decision. Format your response as:
 
-Your decision:"""
+**THINKING:**
+[Your detailed analysis and reasoning here]
+- Consider the trader's strategy and current market conditions
+- Evaluate current positions and their performance
+- Identify what data you expect to receive vs what additional data you might need
+
+**DECISION:**
+[Your final decision - use one of the formats below]
+
+Available additional indicators you can request:
+{indicators_text}
+
+Decision options:
+- PROCEED_WITH_AUTO_FETCHED_DATA (use the automatically provided data)
+- NEED_INDICATOR <script_name> <exchange> <symbol> [additional_params...]
+
+You can request MULTIPLE additional indicators by listing them each on a new line:
+
+**DECISION:**
+NEED_INDICATOR market_data.py binance BTCUSDT 4h
+NEED_INDICATOR fetch_orderbook.py binance ETHUSDT
+
+Note: Most required data (funding rates, orderbook, sentiment) has already been auto-fetched based on your strategy keywords. Only request additional indicators if you need something beyond the standard set.
+
+Begin your analysis:"""
 
     def _build_phase2_prompt(self, context, indicator_data, phase1_response):
         """Build Phase 2 prompt for final decision
@@ -2673,10 +3214,21 @@ Your decision:"""
         trader = context['trader']
         positions = context['positions']
 
+        # Format position info
+        pos_info = ""
+        if positions['open']:
+            pos_info = f"\nCurrent positions ({len(positions['open'])}):\n"
+            for p in positions['open'][:5]:
+                pos_info += f"  - {p.get('symbol')} {p.get('side')} size={p.get('size')} entry={p.get('entry_price')} pnl={p.get('unrealized_pnl', 0):.2f}\n"
+            pos_info += f"\nTotal Unrealized P&L: ${positions['summary'].get('total_unrealized_pnl', 0):.2f}\n"
+            pos_info += f"Total Realized P&L: ${positions['summary'].get('total_realized_pnl', 0):.2f}\n"
+        else:
+            pos_info = "\nCurrent positions: None\n"
+
         # Format indicator data (CSV format)
         indicator_text = ""
         if indicator_data:
-            indicator_text = "\nADDITIONAL MARKET DATA (CSV format):\n"
+            indicator_text = "\n=== MARKET DATA (CSV format) ===\n"
             for key, value in indicator_data.items():
                 # Truncate to max 50 lines to save tokens
                 lines = value.strip().split('\n')
@@ -2686,41 +3238,103 @@ Your decision:"""
                     preview = value.strip()
                 indicator_text += f"\n{key}:\n{preview}\n"
         else:
-            indicator_text = "\nNo additional indicator data was collected.\n"
+            indicator_text = "\nNo additional market data was collected.\n"
+
+        from .trading_tools import TOOL_DESCRIPTIONS
 
         return f"""{indicator_text}
 
-TRADER CONTEXT:
--Trader ID: {trader['id']}
-- Balance: ${trader['balance']:.2f}
-- Current Positions: {len(positions['open'])}
+=== TRADER CONTEXT ===
+Trader ID: {trader['id']}
+Balance: ${trader['balance']:.2f}
+Equity: ${trader['equity']:.2f}
+{pos_info}
 
-Make your final trading decision based on:
+=== YOUR TASK ===
+Make a final trading decision based on:
 1. Trader profile and strategy
-2. Current positions and PnL
-3. Market data (CSV format - analyze independently)
+2. Current positions and P&L
+3. Market data analysis
 
-IMPORTANT: Respond with ONLY the action command below, no explanation:
+{TOOL_DESCRIPTIONS}
 
-- "OPEN_LONG <exchange> <symbol> <size> [leverage]"
-- "OPEN_SHORT <exchange> <symbol> <size> [leverage]"
-- "CLOSE_POSITION <position_id>"
-- "CLOSE_ALL"
-- "HOLD"
+=== RESPONSE FORMAT ===
 
-Examples:
-OPEN_LONG binance BTCUSDT 0.1 5
-OPEN_SHORT okx ETHUSDT 1.0
-CLOSE_POSITION 123
-CLOSE_ALL
-HOLD
+Format your response as:
 
-Constraints:
+**THINKING:**
+[Your detailed trading analysis here]
+- Analyze market data trends and patterns
+- Evaluate risk vs reward
+- Consider trader's strategy alignment
+- Assess position sizing and timing
+- Explain why this decision is optimal
+
+**ACTION:**
+```python
+# Call one of the trading functions here
+result = await open_position(
+    trader_id="{trader['id']}",
+    exchange="binance",
+    symbol="BTCUSDT",
+    side="long",
+    size=0.1,
+    leverage=5
+)
+print(result.message)
+```
+
+**ACTION RESULT:**
+[The function will execute and the result will be displayed here]
+
+=== EXAMPLES ===
+
+Example 1 - Open a long position:
+```python
+result = await open_position(
+    trader_id="{trader['id']}",
+    exchange="binance",
+    symbol="BTCUSDT",
+    side="long",
+    size=0.05,
+    leverage=10
+)
+```
+
+Example 2 - Open a short position:
+```python
+result = await open_position(
+    trader_id="{trader['id']}",
+    exchange="binance",
+    symbol="BTCUSDT",
+    side="short",
+    size=0.085,
+    leverage=10
+)
+```
+
+Example 3 - Close a specific position:
+```python
+result = await close_position(position_id=123)
+```
+
+Example 4 - Close all positions:
+```python
+result = await close_all_positions(trader_id="{trader['id']}")
+```
+
+Example 5 - Hold (no action):
+```python
+result = hold(trader_id="{trader['id']}")
+```
+
+=== CONSTRAINTS ===
 - Size should be 1-10% of balance (current: ${trader['balance']:.2f})
-- Leverage is optional, default is 1
-- Exchange: binance, okx, bybit, bitget
+- Use correct symbol format: BTCUSDT (NOT BTCUSDTUSDT)
+- Leverage defaults to 1x if not specified
+- Available exchanges: binance, okx, bybit, bitget
 
-Your decision (ONE LINE ONLY):"""
+Begin your analysis and action:"""
 
     async def _call_claude_code_for_decision(self, prompt: str, trader_id: str):
         """Call Claude Code subprocess for AI decision
@@ -2763,6 +3377,119 @@ Your decision (ONE LINE ONLY):"""
             return "ERROR: Claude Code timeout (5 minutes)"
         except Exception as e:
             return f"ERROR: {str(e)}"
+
+    def _discover_indicators(self) -> dict:
+        """Discover all indicator scripts in indicators/ directory
+
+        Returns:
+            Dictionary mapping script names to their metadata
+            {
+                'script_name.py': {
+                    'description': '...',
+                    'parameters': ['--exchange', '--symbol', ...],
+                    'output_columns': ['col1', 'col2', ...]
+                }
+            }
+        """
+        from pathlib import Path
+        import re
+
+        indicators_dir = Path(__file__).parent.parent / "indicators"
+        indicators = {}
+
+        py_files = [f for f in indicators_dir.glob("*.py") if f.name != "__init__.py"]
+
+        for script_file in sorted(py_files):
+            try:
+                content = script_file.read_text(encoding='utf-8')
+                lines = content.split('\n')
+
+                # Extract docstring
+                docstring = ""
+                in_docstring = False
+                docstring_lines = []
+
+                for line in lines:
+                    stripped = line.strip()
+                    if '"""' in stripped or "'''" in stripped:
+                        if not in_docstring:
+                            in_docstring = True
+                            quote_start = stripped.find('"""') if '"""' in stripped else stripped.find("'''")
+                            content_part = stripped[quote_start + 3:].strip()
+                            if content_part:
+                                docstring_lines.append(content_part)
+                            if stripped.count('"""') >= 2 or stripped.count("'''") >= 2:
+                                in_docstring = False
+                                break
+                        else:
+                            in_docstring = False
+                            break
+                    elif in_docstring:
+                        docstring_lines.append(stripped)
+                    if not in_docstring and len(docstring_lines) > 0:
+                        break
+
+                if docstring_lines:
+                    docstring = ' '.join(docstring_lines)
+
+                # Extract argparse parameters
+                params = []
+                # Join the content to better handle multi-line add_argument calls
+                full_content_for_params = '\n'.join(lines)
+
+                # Find all add_argument patterns and extract parameter names
+                # This regex handles both single-line and multi-line add_argument calls
+                add_arg_pattern = r"add_argument\s*\(\s*['\"](--?[\w-]+)"
+                for match in re.finditer(add_arg_pattern, full_content_for_params):
+                    param_name = match.group(1)
+                    if param_name not in params:
+                        params.append(param_name)
+
+                # Stop at parse_args
+                parse_args_match = re.search(r"args\s*=\s*parser\.parse_args\(\)|parser\.parse_args\(\)", full_content_for_params)
+                if parse_args_match:
+                    # Find position and only keep params before this
+                    parse_args_pos = parse_args_match.start()
+                    # Re-scan only the portion before parse_args
+                    params = []
+                    for match in re.finditer(add_arg_pattern, full_content_for_params[:parse_args_pos]):
+                        param_name = match.group(1)
+                        if param_name not in params:
+                            params.append(param_name)
+
+                # Extract output columns from CSV print statement
+                output_columns = []
+                # Look for CSV header print statement (skip error statements)
+                for line in lines:
+                    stripped = line.strip()
+                    # Skip error print statements and look for actual CSV header
+                    if stripped.startswith('print(') and ',' in stripped and 'error' not in stripped.lower():
+                        # Extract CSV header
+                        match = re.search(r'print\s*\(\s*["\']([^"\']+)["\']', stripped)
+                        if match:
+                            header = match.group(1)
+                            # Validate it looks like a CSV header (has commas, not error)
+                            if ',' in header and not header.startswith('error'):
+                                output_columns = header.split(',')
+                                break
+
+                indicators[script_file.name] = {
+                    'description': docstring if docstring else "No description",
+                    'parameters': params,
+                    'output_columns': output_columns,
+                    'full_path': str(script_file)
+                }
+
+            except Exception as e:
+                # Still add entry with error info
+                indicators[script_file.name] = {
+                    'description': f"Error reading: {e}",
+                    'parameters': [],
+                    'output_columns': [],
+                    'full_path': str(script_file)
+                }
+
+        return indicators
 
     def _script_has_limit_param(self, script_name: str) -> bool:
         """Check if indicator script has a --limit parameter
@@ -2810,75 +3537,122 @@ Your decision (ONE LINE ONLY):"""
         default_symbol = trading_pairs[0] if trading_pairs else "BTCUSDT"
         default_exchange = "binance"
 
-        # Extract parameters from response
         import re
+
+        # Check for new dynamic indicator format: NEED_INDICATOR <script_name> [args...]
+        # Match each line that starts with NEED_INDICATOR
+        indicator_matches = re.finditer(r'^NEED_INDICATOR\s+(\S+)(.*)$', response_upper, re.MULTILINE)
+
+        # Collect all indicator requests
+        indicator_requests = []
+        for match in indicator_matches:
+            script_name = match.group(1)
+            args_str = match.group(2).strip()
+            # Parse arguments
+            args_parts = args_str.split() if args_str else []
+            indicator_requests.append((script_name, args_parts))
+
+        # Debug: Log if indicators were detected
+        if indicator_requests:
+            print(f"[DEBUG] Detected {len(indicator_requests)} indicator request(s)")
+            for script, args in indicator_requests:
+                print(f"[DEBUG]   - {script} {' '.join(args)}")
+
+        # Also support legacy format for backward compatibility
         orderbook_match = re.search(r'NEED_ORDERBOOK\s+(\w+)\s+(\w+)', response_upper)
         market_match = re.search(r'NEED_MARKET_DATA\s+(\w+)\s+(\w+)\s+(\w+)', response_upper)
         both_match = re.search(r'NEED_BOTH\s+(\w+)\s+(\w+)\s+(\w+)', response_upper)
 
+        if "NEED_ORDERBOOK" in response_upper or both_match:
+            if orderbook_match:
+                args_parts = [orderbook_match.group(1).lower(), orderbook_match.group(2).upper()]
+            elif both_match:
+                args_parts = [both_match.group(1).lower(), both_match.group(2).upper()]
+            else:
+                args_parts = [default_exchange, default_symbol]
+            indicator_requests.append(("fetch_orderbook.py", args_parts))
+
+        if "NEED_MARKET" in response_upper or both_match:
+            if market_match:
+                args_parts = [market_match.group(1).lower(), market_match.group(2).upper(), market_match.group(3).lower()]
+            elif both_match:
+                args_parts = [both_match.group(1).lower(), both_match.group(2).upper(), both_match.group(3).lower()]
+            else:
+                args_parts = [default_exchange, default_symbol, "1h"]
+            indicator_requests.append(("market_data.py", args_parts))
+
         try:
-            if "NEED_ORDERBOOK" in response_upper or both_match:
-                if orderbook_match:
-                    exchange = orderbook_match.group(1).lower()
-                    symbol = orderbook_match.group(2).upper()
-                elif both_match:
-                    exchange = both_match.group(1).lower()
-                    symbol = both_match.group(2).upper()
-                else:
-                    exchange = default_exchange
-                    symbol = default_symbol
+            # Discover available indicators to validate requests
+            available_indicators = self._discover_indicators()
 
-                print(f"[indicator] running fetch_orderbook: {exchange} {symbol}")
-                orderbook_args = [
-                    "--exchange", exchange,
-                    "--symbol", symbol
-                ]
+            for script_name, args_parts in indicator_requests:
+                # Ensure .py extension (case-insensitive check)
+                script_name_lower = script_name.lower()
+                if not script_name_lower.endswith('.py'):
+                    script_name = script_name + '.py'
+                else:
+                    # Convert to lowercase for matching
+                    # e.g., "MARKET_DATA.PY" -> "market_data.py"
+                    script_name = script_name_lower
+
+                # Validate script exists
+                if script_name not in available_indicators:
+                    self.console.print(f"[Warning] Indicator script not found: {script_name}")
+                    continue
+
+                # Build argument list
+                script_meta = available_indicators[script_name]
+                script_args = []
+
+                # Parse provided args and convert to command line format
+                i = 0
+                exchange = default_exchange
+                symbol = default_symbol
+
+                while i < len(args_parts):
+                    arg = args_parts[i]
+                    if arg.startswith('--'):
+                        # Named argument
+                        script_args.append(arg)
+                        if i + 1 < len(args_parts) and not args_parts[i + 1].startswith('--'):
+                            script_args.append(args_parts[i + 1])
+                            i += 2
+                        else:
+                            i += 1
+                    else:
+                        # Positional argument - try to infer
+                        # First positional is usually exchange
+                        if not any('--exchange' in a for a in script_args):
+                            exchange = arg.lower()
+                            script_args.extend(['--exchange', exchange])
+                        # Second positional is usually symbol
+                        elif not any('--symbol' in a for a in script_args):
+                            symbol = arg.upper()
+                            script_args.extend(['--symbol', symbol])
+                        # Third positional might be interval or other parameter
+                        elif not any('--interval' in a for a in script_args):
+                            script_args.extend(['--interval', arg])
+                        i += 1
 
                 # Add limit if configured and script supports it
                 from .scheduler_config import get_scheduler_config
                 config = get_scheduler_config()
                 limit_config = config.get_int('indicator.limit', 0)
-                if limit_config > 0 and self._script_has_limit_param("fetch_orderbook.py"):
-                    orderbook_args.extend(["--limit", str(limit_config)])
+                if limit_config > 0 and self._script_has_limit_param(script_name):
+                    script_args.extend(["--limit", str(limit_config)])
 
-                orderbook_data = await self._run_indicator("fetch_orderbook.py", orderbook_args)
-                if orderbook_data and not orderbook_data.startswith("error"):
-                    results['orderbook'] = orderbook_data
+                # Run the indicator
+                indicator_key = script_name.replace('.py', '')
+                print(f"[indicator] running {indicator_key}: {' '.join(script_args)}")
 
-            if "NEED_MARKET" in response_upper or both_match:
-                if market_match:
-                    exchange = market_match.group(1).lower()
-                    symbol = market_match.group(2).upper()
-                    interval = market_match.group(3).lower()
-                elif both_match:
-                    exchange = both_match.group(1).lower()
-                    symbol = both_match.group(2).upper()
-                    interval = both_match.group(3).lower()
+                indicator_data = await self._run_indicator(script_name, script_args)
+                if indicator_data and not indicator_data.startswith("error"):
+                    results[indicator_key] = indicator_data
                 else:
-                    exchange = default_exchange
-                    symbol = default_symbol
-                    interval = "1h"
-
-                print(f"[indicator] running market_data: {exchange} {symbol} {interval}")
-                market_args = [
-                    "--exchange", exchange,
-                    "--symbol", symbol,
-                    "--interval", interval
-                ]
-
-                # Add limit if configured and script supports it
-                from .scheduler_config import get_scheduler_config
-                config = get_scheduler_config()
-                limit_config = config.get_int('indicator.limit', 0)
-                if limit_config > 0 and self._script_has_limit_param("market_data.py"):
-                    market_args.extend(["--limit", str(limit_config)])
-
-                market_data = await self._run_indicator("market_data.py", market_args)
-                if market_data and not market_data.startswith("error"):
-                    results['market_data'] = market_data
+                    self.console.print(f"[Warning] Indicator {script_name} failed or returned error")
 
         except Exception as e:
-            self.console.print(f"[Warning] indicatorexecuteexception: {e}")
+            self.console.print(f"[Warning] Indicator execution exception: {e}")
 
         return results
 
@@ -2928,71 +3702,6 @@ Your decision (ONE LINE ONLY):"""
         except Exception as e:
             self.console.print(f"[Warning] indicatorexecutefailed: {e}")
             return None
-
-    async def _execute_decision(self, decision: str, trader_id: str):
-        """Parse and execute AI decision
-
-        Args:
-            decision: Decision string from AI
-            trader_id:Trader ID
-        """
-        decision = decision.strip()
-        parts = decision.split()
-        if not parts:
-            self.console.print("[decision] emptydecision，No action")
-            return
-
-        action = parts[0].upper()
-
-        try:
-            if action == "OPEN_LONG":
-                # Parse: OPEN_LONG <exchange> <symbol> <size> [leverage]
-                if len(parts) < 4:
-                    self.console.print(f"[Error] Invalid OPEN_LONG format: {decision}")
-                    return
-                exchange = parts[1]
-                symbol = parts[2]
-                size = float(parts[3])
-                leverage = int(parts[4]) if len(parts) > 4 else None
-                await self._handle_openposition_command([trader_id, exchange, symbol, "long", str(size)] + ([str(leverage)] if leverage else []))
-
-            elif action == "OPEN_SHORT":
-                # Parse: OPEN_SHORT <exchange> <symbol> <size> [leverage]
-                if len(parts) < 4:
-                    self.console.print(f"[Error] Invalid OPEN_SHORT format: {decision}")
-                    return
-                exchange = parts[1]
-                symbol = parts[2]
-                size = float(parts[3])
-                leverage = int(parts[4]) if len(parts) > 4 else None
-                await self._handle_openposition_command([trader_id, exchange, symbol, "short", str(size)] + ([str(leverage)] if leverage else []))
-
-            elif action == "CLOSE_POSITION":
-                # Parse: CLOSE_POSITION <position_id>
-                if len(parts) < 2:
-                    self.console.print(f"[Error] Invalid CLOSE_POSITION format: {decision}")
-                    return
-                position_id = parts[1]
-                await self._handle_closeposition_command([position_id])
-
-            elif action == "CLOSE_ALL":
-                # Close all positions for trader
-                with PositionDatabase() as db:
-                    positions = db.list_positions(trader_id, status='open')
-                    for pos in positions:
-                        self.console.print(f"[execute] close: {pos.id}")
-                        await self._handle_closeposition_command([str(pos.id)])
-
-            elif action == "HOLD":
-                print("[decision] hold - No action")
-
-            else:
-                self.console.print(f"[Error] notknowdecisiontype: {action}")
-
-        except Exception as e:
-            self.console.print(f"[Error] executedecisionfailed: {e}")
-            import traceback
-            self.console.print(f"[debug] {traceback.format_exc()}")
 
     async def _show_trader_positions(self, trader_id: str):
         """Display trader's positions with updated PnL
@@ -3649,6 +4358,29 @@ Your decision (ONE LINE ONLY):"""
         """
         import os
         import subprocess
+        import time
+
+        # Initialize activity log database
+        log_db = ActivityLogDatabase()
+        log_db.initialize()
+
+        # Track execution time
+        start_time = time.time()
+
+        # Initialize logging data
+        log_data = {
+            'trader_id': None,
+            'status': 'SUCCESS',
+            'error_message': None,
+            'execution_time_ms': None,
+            'before_strategy': None,
+            'after_strategy': None,
+            'performance_data': None,
+            'position_history': None,
+            'optimization_prompt': None,
+            'claude_response': None,
+            'changes_made': None,
+        }
 
         # Parse trader_id
         if not args:
@@ -3657,6 +4389,7 @@ Your decision (ONE LINE ONLY):"""
             return
 
         trader_id = args[0]
+        log_data['trader_id'] = trader_id
 
         # Initialize databases
         trader_db = TraderDatabase()
@@ -3669,17 +4402,36 @@ Your decision (ONE LINE ONLY):"""
             trader = trader_db.get_trader(trader_id)
             if not trader:
                 self.console.print(f"[yellow]Trader with ID '{trader_id}' not found[/yellow]")
+                log_data['status'] = 'ERROR'
+                log_data['error_message'] = f"Trader '{trader_id}' not found"
+                log_db.log_optimization(**log_data)
                 return
+
+            # Store before strategy for logging
+            log_data['before_strategy'] = {
+                'characteristics': trader.get('characteristics', {}),
+                'style': trader.get('style', ''),
+                'strategy': trader.get('strategy', {}),
+                'trading_pairs': trader.get('trading_pairs', []),
+                'timeframes': trader.get('timeframes', []),
+                'indicators': trader.get('indicators', []),
+            }
 
             # Get trader file path
             trader_file = trader.get('trader_file', '')
             if not trader_file or not os.path.exists(trader_file):
                 self.console.print(f"[red]Error: Trader file not found {trader_file}[/red]")
+                log_data['status'] = 'ERROR'
+                log_data['error_message'] = f"Trader file not found: {trader_file}"
+                log_db.log_optimization(**log_data)
                 return
 
             # Get position history
             positions_summary = pos_db.get_trader_positions_summary(trader_id)
             all_positions = pos_db.list_positions(trader_id)
+
+            # Store performance data for logging
+            log_data['performance_data'] = positions_summary
 
             # Show trader info
             chars = trader.get('characteristics', {})
@@ -3722,6 +4474,9 @@ Your decision (ONE LINE ONLY):"""
             if positions_summary['total_positions'] == 0:
                 self.console.print("[yellow]thistraderstillNotradeeasyrecords，Cannotenterwalkoptimizeanalyze[/yellow]")
                 self.console.print("[dim]buildproposalfirstUse /decide commandenterwalkonesometradeeasy，accumulateaccumulatehistoryhistorydataafteragainenterwalkoptimize[/dim]")
+                log_data['status'] = 'NO_CHANGES'
+                log_data['error_message'] = 'No trading history available for optimization'
+                log_db.log_optimization(**log_data)
                 return
 
             # Find Claude Code executable
@@ -3729,6 +4484,9 @@ Your decision (ONE LINE ONLY):"""
             if not claude_path:
                 self.console.print("[red]Error: notfound Claude Code canexecuteFile[/red]")
                 self.console.print("[yellow]Please visit https://code.claude.com install Claude Code[/yellow]")
+                log_data['status'] = 'ERROR'
+                log_data['error_message'] = 'Claude Code executable not found'
+                log_db.log_optimization(**log_data)
                 return
 
             # Store file modification time
@@ -3750,6 +4508,9 @@ Your decision (ONE LINE ONLY):"""
                     'exit_time': pos.exit_time.isoformat() if pos.exit_time else None,
                 }
                 position_details.append(detail)
+
+            # Store position history for logging
+            log_data['position_history'] = position_details
 
             # Convert to readable format for Claude
             import json
@@ -3825,6 +4586,8 @@ After your analysis:
 
 Begin your optimization analysis now."""
 
+            log_data['optimization_prompt'] = instructions
+
             self.console.print("[cyan]Nowcalling Claude Code enterwalkselfIoptimizeanalyze...[/cyan]\n")
 
             try:
@@ -3850,12 +4613,19 @@ Begin your optimization analysis now."""
                     process.kill()
                     raise e
 
+                claude_output = '\n'.join(output_lines)
+                log_data['claude_response'] = claude_output
+
                 # Wait for process to complete
                 try:
                     return_code = process.wait(timeout=300)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     self.console.print("[red]Error: Claude Code Execution timeout（5minutes）[/red]")
+                    log_data['status'] = 'ERROR'
+                    log_data['error_message'] = 'Claude Code execution timeout (5 minutes)'
+                    log_data['execution_time_ms'] = (time.time() - start_time) * 1000
+                    log_db.log_optimization(**log_data)
                     return
 
                 # Check if file was modified
@@ -3864,6 +4634,7 @@ Begin your optimization analysis now."""
                 if mtime_after == mtime_before:
                     self.console.print("\n[yellow]analyzecompleted，profileNoneedmodify[/yellow]")
                     self.console.print("[dim]Trader performance statistics[/dim]")
+                    log_data['status'] = 'NO_CHANGES'
                 else:
                     # Re-parse the modified trader file
                     trader_path = Path(trader_file)
@@ -3881,6 +4652,34 @@ Begin your optimization analysis now."""
                         'metadata': updated_data.get('metadata', {})
                     }
 
+                    # Store after strategy for logging
+                    log_data['after_strategy'] = {
+                        'characteristics': updated_data.get('characteristics', {}),
+                        'style': updated_data.get('style', ''),
+                        'strategy': updated_data.get('strategy', {}),
+                        'trading_pairs': updated_data.get('trading_pairs', []),
+                        'timeframes': updated_data.get('timeframes', []),
+                        'indicators': updated_data.get('indicators', []),
+                    }
+
+                    # Detect changes made
+                    changes = []
+                    before = log_data['before_strategy']
+                    after = log_data['after_strategy']
+
+                    if before.get('strategy') != after.get('strategy'):
+                        changes.append("Strategy parameters updated")
+                    if before.get('characteristics') != after.get('characteristics'):
+                        changes.append("Trader characteristics updated")
+                    if before.get('trading_pairs') != after.get('trading_pairs'):
+                        changes.append("Trading pairs updated")
+                    if before.get('timeframes') != after.get('timeframes'):
+                        changes.append("Timeframes updated")
+                    if before.get('indicators') != after.get('indicators'):
+                        changes.append("Indicators updated")
+
+                    log_data['changes_made'] = changes if changes else ["Profile file modified (no structural changes detected)"]
+
                     # Update database
                     success = trader_db.update_trader(trader_id, update_record)
 
@@ -3892,16 +4691,30 @@ Begin your optimization analysis now."""
 
             except subprocess.TimeoutExpired:
                 self.console.print("[red]Error: Claude Code Execution timeout (5minutes)[/red]")
+                log_data['status'] = 'ERROR'
+                log_data['error_message'] = 'Execution timeout'
             except Exception as e:
                 self.console.print(f"[red]Error: {e}[/red]")
                 import traceback
                 self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
+                log_data['status'] = 'ERROR'
+                log_data['error_message'] = str(e)
 
         except Exception as e:
             self.console.print(f"[red]Error: {e}[/red]")
             import traceback
             self.console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            log_data['status'] = 'ERROR'
+            log_data['error_message'] = str(e)
+
         finally:
+            # Calculate execution time and log
+            log_data['execution_time_ms'] = (time.time() - start_time) * 1000
+            try:
+                log_db.log_optimization(**log_data)
+            except Exception:
+                pass  # Don't fail if logging fails
+
             trader_db.close()
             pos_db.close()
 
@@ -4124,6 +4937,239 @@ queuetask: {status['queue_size']}
 
         self.console.print(table)
 
+    async def _handle_logs_command(self, args: list):
+        """View activity logs (decisions and optimizations)
+
+        Usage:
+            /logs decision [trader_id] [limit]     - Show decision logs
+            /logs optimization [trader_id] [limit] - Show optimization logs
+            /logs stats [trader_id]                - Show activity statistics
+
+        Args:
+            args: Command arguments
+        """
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.text import Text
+
+        log_db = ActivityLogDatabase()
+        log_db.initialize()
+
+        if not args:
+            # Show help
+            help_text = Text()
+            help_text.append("Activity Logs - View trader decision and optimization history\n\n", style="bold cyan")
+            help_text.append("Usage:\n", style="white")
+            help_text.append("  /logs decision [trader_id] [limit] [--thinking]     - Show decision logs\n", style="yellow")
+            help_text.append("  /logs optimization [trader_id] [limit]            - Show optimization logs\n", style="yellow")
+            help_text.append("  /logs stats [trader_id]                           - Show activity statistics\n\n", style="yellow")
+            help_text.append("Options:\n", style="white")
+            help_text.append("  --thinking   - Show AI's detailed thinking process\n", style="dim")
+            help_text.append("  --detail     - Show full log details\n", style="dim")
+
+            self.console.print(Panel(help_text, border_style="cyan"))
+            return
+
+        log_type = args[0]
+
+        if log_type == "decision":
+            # Parse arguments
+            trader_id = None
+            limit = 20
+            show_thinking = False
+            show_detail = False
+
+            # Parse args with flags
+            i = 1
+            while i < len(args):
+                if args[i] == "--thinking":
+                    show_thinking = True
+                elif args[i] == "--detail":
+                    show_detail = True
+                elif args[i].isdigit():
+                    limit = int(args[i])
+                else:
+                    trader_id = args[i]
+                i += 1
+
+            # Get logs
+            logs = log_db.get_decision_logs(trader_id=trader_id, limit=limit)
+
+            if not logs:
+                self.console.print("[dim]No decision logs found[/dim]")
+                return
+
+            # Display logs
+            table = Table(title=f"[bold cyan]Decision Logs[/bold cyan]")
+            table.add_column("ID", style="dim")
+            table.add_column("Trader ID", style="cyan")
+            table.add_column("Timestamp", style="yellow")
+            table.add_column("Decision", style="green")
+            table.add_column("Status", style="white")
+            table.add_column("Time (ms)", style="dim")
+            table.add_column("Source", style="dim")
+
+            for log in logs:
+                # Format timestamp
+                timestamp = log['timestamp'][:19] if log['timestamp'] else 'N/A'
+
+                # Format decision
+                decision = log.get('final_decision') or 'N/A'
+                if len(decision) > 30:
+                    decision = decision[:27] + "..."
+
+                # Status color
+                status = log.get('status', 'UNKNOWN')
+                status_style = "green" if status == "SUCCESS" else "red" if status == "ERROR" else "yellow"
+
+                # Execution time
+                exec_time = f"{log.get('execution_time_ms', 0):.1f}" if log.get('execution_time_ms') else 'N/A'
+
+                # Source
+                source = log.get('trigger_source', 'manual')
+
+                table.add_row(
+                    str(log['id']),
+                    log['trader_id'],
+                    timestamp,
+                    decision,
+                    f"[{status_style}]{status}[/{status_style}]",
+                    exec_time,
+                    source
+                )
+
+            self.console.print(table)
+
+            # Show detailed log if specified
+            if show_detail and logs:
+                self.console.print("\n[bold]Detailed Log Entry:[/bold]")
+                log = logs[0]
+                for key, value in log.items():
+                    if value and key not in ['id']:
+                        self.console.print(f"[cyan]{key}:[/cyan] {value}")
+
+            # Show thinking process if specified
+            if show_thinking and logs:
+                self.console.print("\n[bold yellow]AI Thinking Process:[/bold yellow]")
+
+                for idx, log in enumerate(logs[:3]):  # Show up to 3 entries
+                    self.console.print(f"\n[bold cyan]--- Entry #{log['id']} - {log['timestamp'][:19]} ---[/bold cyan]")
+                    self.console.print(f"[dim]Trader: {log['trader_id']} | Decision: {log.get('final_decision', 'N/A')}[/dim]\n")
+
+                    # Phase 1 thinking
+                    if log.get('phase1_thinking'):
+                        self.console.print("[yellow]Phase 1 - Initial Assessment:[/yellow]")
+                        self.console.print(Panel(log['phase1_thinking'], border_style="dim"))
+                    else:
+                        self.console.print("[dim]Phase 1: No thinking process recorded[/dim]\n")
+
+                    # Phase 2 thinking
+                    if log.get('phase2_thinking'):
+                        self.console.print("[yellow]Phase 2 - Final Decision Analysis:[/yellow]")
+                        self.console.print(Panel(log['phase2_thinking'], border_style="dim"))
+                    else:
+                        self.console.print("[dim]Phase 2: No thinking process recorded[/dim]\n")
+
+                    if idx < min(len(logs), 3) - 1:
+                        self.console.print("")
+
+        elif log_type == "optimization":
+            # Parse arguments
+            trader_id = args[1] if len(args) > 1 else None
+            limit = int(args[2]) if len(args) > 2 and args[2].isdigit() else 20
+
+            # Get logs
+            logs = log_db.get_optimization_logs(trader_id=trader_id, limit=limit)
+
+            if not logs:
+                self.console.print("[dim]No optimization logs found[/dim]")
+                return
+
+            # Display logs
+            table = Table(title=f"[bold cyan]Optimization Logs[/bold cyan]")
+            table.add_column("ID", style="dim")
+            table.add_column("Trader ID", style="cyan")
+            table.add_column("Timestamp", style="yellow")
+            table.add_column("Changes", style="green")
+            table.add_column("Status", style="white")
+            table.add_column("Time (ms)", style="dim")
+
+            for log in logs:
+                # Format timestamp
+                timestamp = log['timestamp'][:19] if log['timestamp'] else 'N/A'
+
+                # Format changes
+                changes = log.get('changes_made') or []
+                changes_str = ', '.join(changes) if changes else 'None'
+                if len(changes_str) > 40:
+                    changes_str = changes_str[:37] + "..."
+
+                # Status color
+                status = log.get('status', 'UNKNOWN')
+                status_style = "green" if status == "SUCCESS" else "red" if status == "ERROR" else "yellow"
+
+                # Execution time
+                exec_time = f"{log.get('execution_time_ms', 0):.1f}" if log.get('execution_time_ms') else 'N/A'
+
+                table.add_row(
+                    str(log['id']),
+                    log['trader_id'],
+                    timestamp,
+                    changes_str,
+                    f"[{status_style}]{status}[/{status_style}]",
+                    exec_time
+                )
+
+            self.console.print(table)
+
+        elif log_type == "stats":
+            # Parse arguments
+            trader_id = args[1] if len(args) > 1 else None
+
+            # Get statistics
+            decision_stats = log_db.get_decision_statistics(trader_id=trader_id)
+            optimization_stats = log_db.get_optimization_statistics(trader_id=trader_id)
+
+            # Build stats display
+            stats_text = Text()
+            if trader_id:
+                stats_text.append(f"Activity Statistics for Trader: {trader_id}\n\n", style="bold cyan")
+            else:
+                stats_text.append("Overall Activity Statistics\n\n", style="bold cyan")
+
+            # Decision stats
+            stats_text.append("Decision Logs:\n", style="bold yellow")
+            stats_text.append(f"  Total: {decision_stats['total_decisions']}\n", style="white")
+            stats_text.append(f"  Successful: {decision_stats['successful_decisions']}\n", style="green")
+            stats_text.append(f"  Failed: {decision_stats['failed_decisions']}\n", style="red")
+            stats_text.append(f"  Avg Time: {decision_stats['avg_execution_time_ms']:.1f}ms\n", style="cyan")
+
+            if decision_stats['last_decision_time']:
+                last_time = decision_stats['last_decision_time'][:19]
+                stats_text.append(f"  Last Decision: {last_time}\n", style="dim")
+
+            stats_text.append("\n")
+
+            # Optimization stats
+            stats_text.append("Optimization Logs:\n", style="bold yellow")
+            stats_text.append(f"  Total: {optimization_stats['total_optimizations']}\n", style="white")
+            stats_text.append(f"  Successful: {optimization_stats['successful_optimizations']}\n", style="green")
+            stats_text.append(f"  Failed: {optimization_stats['failed_optimizations']}\n", style="red")
+            stats_text.append(f"  No Changes: {optimization_stats['no_changes_optimizations']}\n", style="yellow")
+            stats_text.append(f"  Avg Time: {optimization_stats['avg_execution_time_ms']:.1f}ms\n", style="cyan")
+
+            if optimization_stats['last_optimization_time']:
+                last_time = optimization_stats['last_optimization_time'][:19]
+                stats_text.append(f"  Last Optimization: {last_time}\n", style="dim")
+
+            self.console.print(Panel(stats_text, border_style="cyan"))
+
+        else:
+            self.console.print(f"[red]Unknown log type: {log_type}[/red]")
+            self.console.print("[dim]Use: /logs decision|optimization|stats[/dim]")
+
+        log_db.close()
+
     async def _confirm_async(self, message: str) -> bool:
         """differentstepconfirmconfirmhint
 
@@ -4198,6 +5244,9 @@ queuetask: {status['queue_size']}
 
                 elif command == "/config":
                     await self._handle_config_command(args)
+
+                elif command == "/logs":
+                    await self._handle_logs_command(args)
 
                 else:
                     self.console.print(
