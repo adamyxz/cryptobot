@@ -14,8 +14,8 @@ from .position_db import PositionDatabase
 from .trader_db import TraderDatabase
 from .price_service import get_price_service
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging - use WARNING to avoid interfering with Rich Console
+logging.basicConfig(level=logging.WARNING, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 

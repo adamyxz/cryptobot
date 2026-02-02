@@ -75,11 +75,11 @@ class PriceUpdateService:
                 lambda: exchange_instance.fetch_ticker(ccxt_symbol)
             )
         except Exception as e:
-            raise RuntimeError(f"获取价格失败 {exchange} {symbol}: {e}")
+            raise RuntimeError(f"Failed to fetch price {exchange} {symbol}: {e}")
 
         current_price = ticker.get('last')
         if current_price is None or current_price <= 0:
-            raise RuntimeError(f"无效的价格: {current_price}")
+            raise RuntimeError(f"Invalid price: {current_price}")
 
         # Update cache
         self.price_cache[cache_key] = (float(current_price), time.time())

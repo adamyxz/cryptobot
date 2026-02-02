@@ -6,9 +6,9 @@ Generate unique, diverse cryptocurrency trading strategy profiles as markdown fi
 
 ## Critical Requirement: DIVERSITY
 
-**Before creating any new trader, you MUST:**
+**The existing traders summary is provided in the instructions - use it to ensure diversity!**
 
-1. Read all existing trader `profile.md` files (located in subdirectories like `TraderName_ID/profile.md`)
+1. Review the existing traders summary provided in the instructions
 2. Analyze their characteristics, trading styles, strategies, and approaches
 3. Ensure your new trader is **significantly different** from all existing traders
 
@@ -163,17 +163,16 @@ Each trader file MUST follow this structure:
 
 ## Generation Process
 
-### Step 1: Survey Existing Traders
+### Step 1: Review Provided Trader Summary
 
-1. List all subdirectories containing `profile.md` files
-2. Read each `profile.md` file completely
-3. Extract key characteristics from each:
-   - Trading style
+The existing traders summary is already provided in your instructions, showing:
+   - Trader IDs
+   - Trading styles
    - Risk tolerance
+   - Trading pairs
    - Timeframes
-   - Asset preferences
-   - Technical approach
-   - Philosophy
+
+Use this summary to understand what already exists.
 
 ### Step 2: Identify Gaps
 
@@ -255,7 +254,7 @@ When designing traders, vary across these axes:
 
 When the user invokes `/newtrader`:
 
-1. **ALWAYS** read all existing `profile.md` files first (in subdirectories)
+1. **ALWAYS** review the existing traders summary provided in the instructions
 2. **ALWAYS** analyze what's missing or underrepresented
 3. **ALWAYS** create someone distinctly different
 4. **NEVER** skip the diversity check

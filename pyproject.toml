@@ -1,7 +1,7 @@
 [project]
 name = "cryptobot"
 version = "0.1.0"
-description = "K线数据订阅 CLI 工具"
+description = "K-line Data Subscription CLI Tool"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [

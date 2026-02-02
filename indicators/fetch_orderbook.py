@@ -51,7 +51,9 @@ def fetch_orderbook(exchange: str, symbol: str, limit: int = 20) -> List[Tuple[s
         return result
 
     finally:
-        exchange_inst.close()
+        # Note: ccxt sync exchanges don't have a close() method
+        # The connection will be cleaned up automatically
+        pass
 
 
 def main():

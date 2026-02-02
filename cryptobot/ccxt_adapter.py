@@ -157,7 +157,7 @@ def _find_matching_swap_market_sync(exchange, user_symbol: str) -> str:
             if normalized_symbol.startswith(normalized_user_simple[:6]):  # First 6 chars should match
                 return symbol
 
-    raise ValueError(f"未找到永续合约交易对: {user_symbol}")
+    raise ValueError(f"Perpetual futures trading pair not found: {user_symbol}")
 
 
 async def find_matching_swap_market(exchange, user_symbol: str) -> str:
@@ -245,7 +245,7 @@ async def find_matching_swap_market(exchange, user_symbol: str) -> str:
             if normalized_symbol.startswith(normalized_user_simple[:6]):  # First 6 chars should match
                 return symbol
 
-    raise ValueError(f"未找到永续合约交易对: {user_symbol}")
+    raise ValueError(f"Perpetual futures trading pair not found: {user_symbol}")
 
 
 def create_exchange_instance(exchange: str, config: Optional[Dict] = None) -> ccxt.Exchange:
@@ -265,8 +265,8 @@ def create_exchange_instance(exchange: str, config: Optional[Dict] = None) -> cc
 
     if exchange_lower not in EXCHANGE_MAP:
         raise ValueError(
-            f"不支持的交易所: {exchange}. "
-            f"支持的交易所: {', '.join(EXCHANGE_MAP.keys())}"
+            f"Unsupported exchange: {exchange}. "
+            f"Supported exchanges: {', '.join(EXCHANGE_MAP.keys())}"
         )
 
     exchange_class = EXCHANGE_MAP[exchange_lower]
@@ -361,7 +361,7 @@ async def fetch_ohlcv(
             )
         )
     except Exception as e:
-        raise RuntimeError(f"获取数据失败: {e}")
+        raise RuntimeError(f"Failed to fetch data: {e}")
 
     # Convert to standard format
     klines = []
@@ -392,7 +392,7 @@ async def fetch_swap_markets(exchange: str) -> List[Dict]:
     try:
         markets = exchange_instance.load_markets()
     except Exception as e:
-        raise RuntimeError(f"加载市场数据失败: {e}")
+        raise RuntimeError(f"Failed to load market data: {e}")
 
     # Filter only swap (perpetual) markets
     swap_markets = []

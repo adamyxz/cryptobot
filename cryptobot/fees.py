@@ -58,12 +58,12 @@ def calculate_fee(
 
     if exchange_lower not in EXCHANGE_FEES:
         raise ValueError(
-            f"不支持的交易所: {exchange}. "
-            f"支持的交易所: {', '.join(EXCHANGE_FEES.keys())}"
+            f"Unsupported exchange: {exchange}. "
+            f"Supported exchanges: {', '.join(EXCHANGE_FEES.keys())}"
         )
 
     if order_type not in ('maker', 'taker'):
-        raise ValueError(f"无效的订单类型: {order_type}. 必须是 'maker' 或 'taker'")
+        raise ValueError(f"Invalid order type: {order_type}. Must be 'maker' or 'taker'")
 
     fee_rate = EXCHANGE_FEES[exchange_lower][order_type]
 
@@ -92,12 +92,12 @@ def get_exchange_fee(exchange: str, order_type: str = 'taker') -> float:
 
     if exchange_lower not in EXCHANGE_FEES:
         raise ValueError(
-            f"不支持的交易所: {exchange}. "
-            f"支持的交易所: {', '.join(EXCHANGE_FEES.keys())}"
+            f"Unsupported exchange: {exchange}. "
+            f"Supported exchanges: {', '.join(EXCHANGE_FEES.keys())}"
         )
 
     if order_type not in ('maker', 'taker'):
-        raise ValueError(f"无效的订单类型: {order_type}. 必须是 'maker' 或 'taker'")
+        raise ValueError(f"Invalid order type: {order_type}. Must be 'maker' or 'taker'")
 
     return EXCHANGE_FEES[exchange_lower][order_type]
 

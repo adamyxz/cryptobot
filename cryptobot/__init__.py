@@ -1,3 +1,3 @@
-"""CryptoBot - K线数据订阅工具"""
+"""CryptoBot - K-line Data Subscription Tool"""
 
 __version__ = "0.1.0"

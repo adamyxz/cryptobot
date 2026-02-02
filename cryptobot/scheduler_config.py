@@ -23,6 +23,9 @@ class SchedulerConfig:
         'trigger.price.enabled': ('true', 'bool', 'Enable price-based triggers'),
         'trigger.price.change_threshold': ('0.04', 'float', 'Price change threshold (4%)'),
 
+        # Indicator settings
+        'indicator.limit': ('0', 'int', 'Indicator data limit (0 = unlimited)'),
+
         # Optimization settings
         'optimize.enabled': ('true', 'bool', 'Enable automatic optimization'),
         'optimize.min_positions': ('5', 'int', 'Minimum positions before optimization'),
@@ -32,6 +35,11 @@ class SchedulerConfig:
         'priority.low_balance_threshold': ('5000', 'float', 'Low balance threshold'),
         'priority.low_balance_priority': ('2', 'int', 'Priority for low balance traders'),
         'priority.scalping_priority': ('3', 'int', 'Priority for scalping traders'),
+
+        # Trader constraints
+        'trader.pairs.max': ('10', 'int', 'Maximum number of trading pairs per trader'),
+        'trader.intervals.min_seconds': ('300', 'int', 'Minimum interval in seconds (5 minutes)'),
+        'trader.intervals.max': ('5', 'int', 'Maximum number of intervals per trader'),
     }
 
     def __init__(self, db_path: str = None):
