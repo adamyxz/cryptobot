@@ -17,6 +17,10 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
+from rich.live import Live
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.text import Text
 
 from .exchanges import (
     get_exchange_config,
@@ -63,6 +67,13 @@ class CryptoBot:
         self.trader_db = None
         self.pos_db = None
         self.scheduler = None
+
+        # UI components
+        self.live = None
+        self.dashboard = None
+        self.output_history = []  # Store command outputs
+        self._ui_running = False
+        self._ui_lock = asyncio.Lock()
 
     def _print_banner(self):
         """Print welcome banner"""
@@ -401,6 +412,100 @@ class CryptoBot:
         args = parts[1:] if len(parts) > 1 else []
 
         return command, args
+
+    def _init_databases(self):
+        """Initialize databases if not already initialized"""
+        if not self.trader_db:
+            self.trader_db = TraderDatabase()
+            self.trader_db.initialize()
+
+        if not self.pos_db:
+            self.pos_db = PositionDatabase()
+            self.pos_db.initialize()
+
+    def _init_dashboard(self):
+        """Initialize dashboard if not already initialized"""
+        from .scheduler_dashboard import SchedulerDashboard
+
+        if not self.dashboard:
+            self._init_databases()
+            self.dashboard = SchedulerDashboard(self.trader_db, self.pos_db)
+
+    def _print_output(self, message: str, style: str = "white"):
+        """Print message to output history (for display in UI)
+
+        Args:
+            message: Message to print
+            style: Rich style
+        """
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.output_history.append({
+            'time': timestamp,
+            'message': message,
+            'style': style
+        })
+        # Keep only last 100 outputs
+        if len(self.output_history) > 100:
+            self.output_history.pop(0)
+
+    def _build_output_panel(self) -> Panel:
+        """Build the output panel for the UI
+
+        Returns:
+            Rich Panel with output history
+        """
+        if not self.output_history:
+            content = Text("[dim]Ready. Type /help for available commands.[/dim]", style="dim")
+        else:
+            content = Text()
+            for entry in self.output_history[-15:]:  # Show last 15 outputs (reduced)
+                content.append(f"[{entry['time']}] ", style="dim")
+                content.append(entry['message'] + "\n", style=entry['style'])
+
+        return Panel(
+            content,
+            title="[bold]Command Output[/bold]",
+            border_style="dim",
+            height=8  # Reduced height to leave room for input
+        )
+
+    def _build_ui_layout(self) -> Layout:
+        """Build the main UI layout
+
+        Returns:
+            Rich Layout with dashboard on top, output on bottom
+        """
+        layout = Layout()
+
+        # Split vertically: dashboard on top, output on bottom
+        layout.split_column(
+            Layout(name="dashboard", ratio=2),
+            Layout(name="output", ratio=1)
+        )
+
+        # Add dashboard (or empty panel if not initialized)
+        if self.dashboard:
+            layout["dashboard"].update(self.dashboard.render())
+        else:
+            layout["dashboard"].update(Panel(
+                Text("[dim]Dashboard will appear here[/dim]", style="dim"),
+                title="[bold cyan]Trader Monitor[/bold cyan] [dim]○[/dim] [dim]Stopped[/dim]",
+                border_style="cyan"
+            ))
+
+        # Add output panel
+        layout["output"].update(self._build_output_panel())
+
+        return layout
+
+    async def _ui_refresh_loop(self):
+        """Background task to refresh the UI"""
+        while self._ui_running:
+            if self._ui_running:  # Double-check
+                # Clear screen and print UI
+                self.console.clear()
+                self.console.print(self._build_ui_layout())
+            await asyncio.sleep(1)  # Refresh every second
 
     def _create_key_bindings(self):
         """Create key bindings
@@ -2919,6 +3024,7 @@ If test files are created during testing, clean them up after tests pass."""
         from .trading_tools import TradingTools
         from .trader_db import TraderDatabase
         from .position_db import PositionDatabase
+        from .scheduler_config import get_scheduler_config
 
         # Initialize databases
         trader_db = TraderDatabase()
@@ -2929,25 +3035,26 @@ If test files are created during testing, clean them up after tests pass."""
         # Create trading tools instance
         tools = TradingTools(self.console, pos_db, trader_db)
 
+        # Get configured default exchange to override AI's choice
+        config = get_scheduler_config()
+        configured_exchange = config.get_string('indicator.exchange', 'okx')
+
+        # Create wrapper for open_position that forces configured exchange
+        async def open_position_with_config(**kwargs):
+            """Wrapper that forces the use of configured exchange"""
+            # Override exchange parameter with config value
+            kwargs['exchange'] = configured_exchange
+            return await tools.open_position(**kwargs)
+
         # Prepare execution context
         exec_globals = {
-            'open_position': tools.open_position,
+            'open_position': open_position_with_config,
             'close_position': tools.close_position,
             'close_all_positions': tools.close_all_positions,
             'hold': tools.hold,
             'trader_id': trader_id,
-            '__builtins__': {
-                'print': print,
-                'len': len,
-                'str': str,
-                'int': int,
-                'float': float,
-                'bool': bool,
-                'list': list,
-                'dict': dict,
-                'range': range,
-                'locals': locals,
-            }
+            'console': self.console,  # Add console for AI code to use
+            '__builtins__': __builtins__,
         }
 
         # Capture output
@@ -3174,8 +3281,14 @@ Begin your analysis:"""
         Returns:
             Prompt string for Claude Code
         """
+        from .scheduler_config import get_scheduler_config
+
         trader = context['trader']
         positions = context['positions']
+
+        # Get configured default exchange
+        config = get_scheduler_config()
+        default_exchange = config.get_string('indicator.exchange', 'okx')
 
         # Format position info
         pos_info = ""
@@ -3213,6 +3326,10 @@ Balance: ${trader['balance']:.2f}
 Equity: ${trader['equity']:.2f}
 {pos_info}
 
+=== CONFIGURED DEFAULT EXCHANGE ===
+The default exchange is: {default_exchange}
+IMPORTANT: You MUST use this exchange in your trading decisions unless there's a specific reason to use a different exchange.
+
 === YOUR TASK ===
 Make a final trading decision based on:
 1. Trader profile and strategy
@@ -3236,9 +3353,10 @@ Format your response as:
 **ACTION:**
 ```python
 # Call one of the trading functions here
+# IMPORTANT: Use the configured default exchange: {default_exchange}
 result = await open_position(
     trader_id="{trader['id']}",
-    exchange="binance",
+    exchange="{default_exchange}",
     symbol="BTCUSDT",
     side="long",
     size=0.1,
@@ -3256,7 +3374,7 @@ Example 1 - Open a long position:
 ```python
 result = await open_position(
     trader_id="{trader['id']}",
-    exchange="binance",
+    exchange="{default_exchange}",
     symbol="BTCUSDT",
     side="long",
     size=0.05,
@@ -3268,7 +3386,7 @@ Example 2 - Open a short position:
 ```python
 result = await open_position(
     trader_id="{trader['id']}",
-    exchange="binance",
+    exchange="{default_exchange}",
     symbol="BTCUSDT",
     side="short",
     size=0.085,
@@ -3296,6 +3414,7 @@ result = hold(trader_id="{trader['id']}")
 - Use correct symbol format: BTCUSDT (NOT BTCUSDTUSDT)
 - Leverage defaults to 1x if not specified
 - Available exchanges: binance, okx, bybit, bitget
+- **IMPORTANT**: Use the configured default exchange ({default_exchange}) unless there's a specific reason to use a different exchange
 
 Begin your analysis and action:"""
 
@@ -3336,7 +3455,14 @@ Begin your analysis and action:"""
 
         except asyncio.TimeoutError:
             if process:
-                process.kill()
+                # Try to terminate gracefully first
+                try:
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    # Force kill if terminate doesn't work
+                    process.kill()
+                    await process.wait()
             return "ERROR: Claude Code timeout (5 minutes)"
         except Exception as e:
             return f"ERROR: {str(e)}"
@@ -3668,7 +3794,14 @@ Begin your analysis and action:"""
             return stdout.decode()
 
         except asyncio.TimeoutError:
-            process.kill()
+            # Try to terminate the process gracefully first
+            try:
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                # Force kill if terminate doesn't work
+                process.kill()
+                await process.wait()
             self.console.print(f"[Warning] indicatortimeout: {script_name}")
             return None
         except Exception as e:
@@ -4698,81 +4831,66 @@ Begin your optimization analysis now."""
             pos_db.close()
 
     async def _handle_start_command(self, args: list):
-        """startholdcontinuerunningmode
+        """Start continuous trading mode
 
         Args:
-            args: [trader_id1, trader_id2, ...] orempty（startall trader）
+            args: [trader_id1, trader_id2, ...] or empty (start all traders)
         """
-        # confirmensuredatalibraryhas beeninitialstartchange
-        if not hasattr(self, 'trader_db') or self.trader_db is None:
-            self.trader_db = TraderDatabase()
-            self.trader_db.initialize()
+        # Initialize databases if needed
+        self._init_databases()
 
-        if not hasattr(self, 'pos_db') or self.pos_db is None:
-            self.pos_db = PositionDatabase()
-            self.pos_db.initialize()
-
-        # fetchwantadjustdegree of trader ID List
+        # Get trader IDs to start
         trader_ids = args if args else None
 
-        # createscheduler（passpassdatalibraryactualexample）
-        if not hasattr(self, 'scheduler') or self.scheduler is None:
+        # Create scheduler if needed
+        if not self.scheduler:
             from .scheduler import TraderScheduler
             self.scheduler = TraderScheduler(self, self.trader_db, self.pos_db)
 
-        # Start scheduler and actual time instruments table (will block, press Ctrl+C to exit)
+        # Link cli_ui to scheduler's dashboard (always do this to ensure sync)
+        self.scheduler.dashboard = self.cli_ui
+
+        # Start scheduler (non-blocking)
         await self.scheduler.start(trader_ids)
 
-        # Instruments table exits, return to REPL
-
     async def _handle_stop_command(self, args: list):
-        """stopstopholdcontinuerunningmode"""
-        if not hasattr(self, 'scheduler') or not self.scheduler.running:
-            print("schedulernotrunning")
+        """Stop continuous trading mode"""
+        if not self.scheduler or not self.scheduler.running:
+            self.cli_ui.add_output("Scheduler is not running", "yellow")
             return
 
         await self.scheduler.stop()
+        self.cli_ui.add_output("Scheduler stopped", "yellow")
 
     async def _handle_status_command(self, args: list):
-        """displayschedulerstatus"""
-        if not hasattr(self, 'scheduler') or not self.scheduler.running:
-            self.console.print("[dim]schedulernotrunning[/dim]")
-            self.console.print("[dim]hint: Use /start [trader_ids] startscheduler[/dim]")
+        """Display scheduler status"""
+        if not self.scheduler or not self.scheduler.running:
+            self.cli_ui.add_output("Scheduler not running. Use /start to begin.", "dim")
             return
-
-        from rich.table import Table
-        from rich.panel import Panel
 
         status = self.scheduler.get_status()
 
-        # totalbodystatusfaceboard
-        status_text = f"""
-[bold cyan]schedulerstatus[/bold cyan]
+        # Build status message
+        running_status = "Running" if status['running'] else "Stopped"
+        status_text = (
+            f"Scheduler Status: {running_status}, "
+            f"Traders: {status['total_traders']} (active: {status['enabled_traders']}), "
+            f"Queue: {status['queue_size']}"
+        )
+        self.cli_ui.add_output(status_text, "cyan")
 
-runningstatus: [{'green' if status['running'] else 'red'}]{'runningin' if status['running'] else 'has beenstopstop'}[/]
-monitorcontrol Trader: {status['total_traders']} (active: {status['enabled_traders']})
-queuetask: {status['queue_size']}
-"""
-        self.console.print(Panel(status_text.strip(), border_style="cyan"))
-
-        # displayqueueextractwant
+        # Show queue summary if tasks exist
         queue_summary = status.get('queue_summary', {})
         if queue_summary.get('total_tasks', 0) > 0:
             by_action = queue_summary.get('tasks_by_action', {})
-            self.console.print(f"[dim]queuein oftask: {queue_summary['total_tasks']}[/dim]")
+            queue_text = f"Queue tasks: {queue_summary['total_tasks']}"
+            self.cli_ui.add_output(queue_text, "dim")
             for action, count in by_action.items():
                 if count > 0:
-                    self.console.print(f"  [dim]- {action}: {count}[/dim]")
+                    self.cli_ui.add_output(f"  - {action}: {count}", "dim")
 
-        # Trader statustable
+        # Show trader status
         if status['traders']:
-            table = Table(title="\n[bold]Trader adjustdegreestatus[/bold]")
-            table.add_column("Trader ID", style="cyan")
-            table.add_column("status", justify="center")
-            table.add_column("last triggered", style="dim")
-            table.add_column("triggersendtimenumber", justify="right")
-            table.add_column("processingin", justify="center")
-
             for t in status['traders']:
                 trader_id = t['trader_id']
                 enabled = t['enabled']
@@ -4780,21 +4898,14 @@ queuetask: {status['queue_size']}
                 total_triggers = t['total_triggers']
                 processing = t['processing']
 
-                # statusdisplay
-                status_str = "[green]✓[/green]" if enabled else "[red]✗[/red]"
+                status_icon = "✓" if enabled else "✗"
+                last_str = last_trigger.strftime("%H:%M:%S") if last_trigger else "-"
 
-                # last triggeredtime
-                if last_trigger:
-                    last_str = last_trigger.strftime("%H:%M:%S")
-                else:
-                    last_str = "-"
+                trader_text = f"{trader_id}: [{status_icon}] Triggers: {total_triggers}, Last: {last_str}"
+                if processing:
+                    trader_text += " [processing]"
 
-                # processinginmarkrecord
-                proc_str = "[yellow]is[/yellow]" if processing else ""
-
-                table.add_row(trader_id, status_str, last_str, str(total_triggers), proc_str)
-
-            self.console.print(table)
+                self.cli_ui.add_output(trader_text, "white")
 
     async def _handle_config_command(self, args: list):
         """viewormodifyconfiguration
@@ -5165,80 +5276,210 @@ queuetask: {status['queue_size']}
         return await loop.run_in_executor(None, lambda: Confirm.ask(message))
 
     async def run(self):
-        """running CLI mainloopenvironment"""
+        """Run CLI main loop with split UI"""
+        # Import UI module
+        from .cli_ui import CLIInterface
+
+        # Print banner first
         self._print_banner()
 
-        while True:
-            try:
-                with patch_stdout():
-                    cmd = await self.session.prompt_async(
-                        "cryptobot>",
-                    )
+        # Initialize databases and UI
+        self._init_databases()
+        self.cli_ui = CLIInterface(self.trader_db, self.pos_db)
+        self.cli_ui.add_output("CryptoBot initialized. Type /help for commands.", "green")
 
-                # parseandprocessingcommand
-                command, args = self._parse_command(cmd)
+        # Auto-refresh: print new messages directly without clearing screen
+        self._auto_refresh_enabled = True
+        self._last_output_count = len(self.cli_ui.output_history)
 
-                if not command:
-                    continue
+        # Start auto-refresh task
+        refresh_task = asyncio.create_task(self._auto_refresh_loop())
 
-                if command in ("/quit", "/exit", "quit", "exit"):
-                    self.console.print("[yellow]Goodbye！[/yellow]")
+        # Print initial UI
+        self._refresh_display()
+
+        try:
+            # Main command loop
+            while True:
+                try:
+                    # Get command input - NO timeout, let user type freely
+                    cmd = await self.session.prompt_async("cryptobot> ")
+
+                    # Parse command
+                    command, args = self._parse_command(cmd)
+
+                    if not command:
+                        continue
+
+                    # Commands that output directly to console
+                    console_commands = {"/market", "/pairs", "/intervals", "/traders",
+                                       "/indicators", "/decide", "/positions", "/optimize",
+                                       "/config", "/logs"}
+
+                    if command in console_commands:
+                        # Clear screen, run command, then restore UI
+                        self.console.clear()
+                        try:
+                            if command == "/market":
+                                await self._handle_rest_command(args)
+                            elif command == "/pairs":
+                                await self._handle_pairs_command(args)
+                            elif command == "/intervals":
+                                await self._handle_intervals_command(args)
+                            elif command == "/traders":
+                                await self._handle_traders_command(args)
+                            elif command == "/indicators":
+                                await self._handle_indicators_command(args)
+                            elif command == "/decide":
+                                await self._handle_decide_command(args)
+                            elif command == "/positions":
+                                await self._handle_positions_command(args)
+                            elif command == "/optimize":
+                                await self._handle_optimize_command(args)
+                            elif command == "/config":
+                                await self._handle_config_command(args)
+                            elif command == "/logs":
+                                await self._handle_logs_command(args)
+
+                            input("\nPress Enter to continue...")
+                        finally:
+                            self._refresh_display()
+
+                    elif command in ("/quit", "/exit", "quit", "exit"):
+                        self.console.print("[yellow]Goodbye![/yellow]")
+                        break
+
+                    elif command == "/help":
+                        self.cli_ui.add_output("Available Commands:", "cyan")
+                        self.cli_ui.add_output("  /start [trader_ids...]  - Start scheduler", "white")
+                        self.cli_ui.add_output("  /stop                   - Stop scheduler", "white")
+                        self.cli_ui.add_output("  /status                 - View status", "white")
+                        self.cli_ui.add_output("  /traders [...]          - Manage traders", "white")
+                        self.cli_ui.add_output("  /decide <trader_id>     - Make decision", "white")
+                        self.cli_ui.add_output("  /optimize <trader_id>   - Optimize trader", "white")
+                        self.cli_ui.add_output("  /positions [...]        - Manage positions", "white")
+                        self.cli_ui.add_output("  /market [...]           - Get market data", "white")
+                        self.cli_ui.add_output("  /quit or /exit          - Exit", "white")
+                        self._refresh_display()
+
+                    elif command == "/start":
+                        await self._handle_start_command(args)
+                        self._refresh_display()
+
+                    elif command == "/stop":
+                        await self._handle_stop_command(args)
+                        self._refresh_display()
+
+                    elif command == "/status":
+                        await self._handle_status_command(args)
+                        self._refresh_display()
+
+                    else:
+                        self.cli_ui.add_output(f"Unknown command: {command}", "red")
+                        self._refresh_display()
+
+                except (KeyboardInterrupt, EOFError):
+                    self.console.print("\n[yellow]Goodbye![/yellow]")
                     break
+                except Exception as e:
+                    self.console.print(f"[red]Error: {e}[/red]")
 
-                elif command == "/help":
-                    self._print_help()
+        finally:
+            # Stop auto-refresh
+            self._auto_refresh_enabled = False
+            if refresh_task:
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except asyncio.CancelledError:
+                    pass
 
-                elif command == "/market":
-                    await self._handle_rest_command(args)
+            # Stop scheduler if running
+            if self.scheduler and self.scheduler.running:
+                await self.scheduler.stop()
 
-                elif command == "/pairs":
-                    await self._handle_pairs_command(args)
+    async def _auto_refresh_loop(self):
+        """Auto-refresh loop - updates display when new data arrives"""
+        import time
+        last_ui_check = time.time()
+        last_price_update = time.time()
+        price_update_interval = 10.0  # Update prices every 10 seconds
 
-                elif command == "/intervals":
-                    await self._handle_intervals_command(args)
+        while self._auto_refresh_enabled:
+            try:
+                current_time = time.time()
 
-                elif command == "/traders":
-                    await self._handle_traders_command(args)
+                # Check for new output or scheduler updates and refresh display
+                if current_time - last_ui_check >= 0.3:  # Check every 0.3 seconds
+                    current_output_count = len(self.cli_ui.output_history)
+                    should_refresh = False
 
-                elif command == "/indicators":
-                    await self._handle_indicators_command(args)
+                    # Check if new outputs arrived
+                    if current_output_count > self._last_output_count:
+                        self._last_output_count = current_output_count
+                        should_refresh = True
 
-                elif command == "/decide":
-                    await self._handle_decide_command(args)
+                    # Check if scheduler is running (data might have changed)
+                    if self.scheduler and self.scheduler.running:
+                        should_refresh = True
 
-                elif command == "/positions":
-                    await self._handle_positions_command(args)
+                    # Refresh display if there are changes
+                    if should_refresh:
+                        self._refresh_display()
 
-                elif command == "/optimize":
-                    await self._handle_optimize_command(args)
+                    last_ui_check = current_time
 
-                elif command == "/start":
-                    await self._handle_start_command(args)
+                # Update prices silently
+                if current_time - last_price_update >= price_update_interval:
+                    if self.scheduler and self.scheduler.running and self.cli_ui.monitored_trader_ids:
+                        from .price_service import get_price_service
+                        price_service = get_price_service()
+                        try:
+                            for trader_id in self.cli_ui.monitored_trader_ids:
+                                try:
+                                    await price_service.update_trader_positions(trader_id, self.pos_db)
+                                except:
+                                    pass
+                        except:
+                            pass
+                    last_price_update = current_time
 
-                elif command == "/stop":
-                    await self._handle_stop_command(args)
+                await asyncio.sleep(0.2)
 
-                elif command == "/status":
-                    await self._handle_status_command(args)
-
-                elif command == "/config":
-                    await self._handle_config_command(args)
-
-                elif command == "/logs":
-                    await self._handle_logs_command(args)
-
-                else:
-                    self.console.print(
-                        f"[red]notknowcommand: {command}. outputenter /help viewhelphelp[/red]"
-                    )
-
-            except (KeyboardInterrupt, EOFError):
-                self.console.print("\n[yellow]Goodbye！[/yellow]")
+            except asyncio.CancelledError:
                 break
-            except Exception as e:
-                # Use Text comeavoidavoidparseexceptioncancelinformationin of Rich marksign
-                from rich.text import Text
-                error_text = Text()
-                error_text.append("Error: ", style="red")
-                error_text.append(str(e))
-                self.console.print(error_text)
+            except Exception:
+                await asyncio.sleep(1.0)
+
+    def _refresh_display(self):
+        """Refresh the display with current UI state"""
+        # Update scheduler running state (the rest is already updated by scheduler)
+        if self.scheduler and self.cli_ui:
+            self.cli_ui.scheduler_running = self.scheduler.running
+
+        # Clear and print UI (use Rich's clear for better compatibility)
+        self.console.clear()
+        for item in self.cli_ui.render():
+            self.console.print(item)
+
+    def _handle_help_inline(self):
+        """Print brief help inline"""
+        help_text = """
+[bold cyan]Available Commands:[/bold cyan]
+  /start [trader_ids...]  - Start scheduler
+  /stop                   - Stop scheduler
+  /traders [...]          - Manage traders
+  /indicators [...]       - Manage indicators
+  /decide <trader_id>     - Make trading decision
+  /optimize <trader_id>   - Optimize trader
+  /positions [...]        - Manage positions
+  /market [...]           - Get market data
+  /pairs [exchange]       - Show trading pairs
+  /intervals              - Show intervals
+  /status                 - Show scheduler status
+  /config [key] [value]   - View/modify config
+  /logs [...]             - View activity logs
+  /help                   - Show this help
+  /quit or /exit          - Exit program
+"""
+        self._print_output(help_text.strip(), "cyan")

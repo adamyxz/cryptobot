@@ -70,8 +70,8 @@ class TraderScheduler:
         self.running = True
 
         # Load traders to schedule
-        if trader_ids is None:
-            # Get all traders
+        if trader_ids is None or len(trader_ids) == 0:
+            # Get all traders (None or empty list means all)
             all_traders = self.trader_db.list_traders()
             trader_ids = [t['id'] for t in all_traders]
 
@@ -90,29 +90,24 @@ class TraderScheduler:
 
         active_count = len(self.tasks)
 
-        # Configure and start dashboard
+        # Configure dashboard
         self.dashboard.set_monitored_traders(list(self.tasks.keys()))
+        self.dashboard.set_scheduler_running(True)
 
-        # Start schedule loop and dashboard in parallel
+        # Start schedule loop (dashboard is managed by CLI)
         self.schedule_task = asyncio.create_task(self._schedule_loop())
-        dashboard_task = asyncio.create_task(self.dashboard.start())
 
-        # Wait for dashboard to exit (Ctrl+C)
-        await dashboard_task
-
-        # Dashboard stopped, stop scheduler
-        await self.stop()
+        self.console.print(f"✓ Scheduler started with {active_count} trader(s)", style="green")
 
     async def stop(self):
         """Stop the scheduler"""
         if not self.running:
             return
 
-        self.dashboard.log("Stopping scheduler...", "warning")
         self.running = False
 
-        # Stop dashboard
-        self.dashboard.stop()
+        # Update dashboard state
+        self.dashboard.set_scheduler_running(False)
 
         # Cancel schedule task
         if self.schedule_task:
@@ -145,13 +140,16 @@ class TraderScheduler:
                 # 2. Check triggers and add tasks to queue
                 await self._check_triggers()
 
-                # 3. Process tasks from queue
+                # 3. Check for stuck tasks and clean them up
+                await self._check_stuck_tasks()
+
+                # 4. Process tasks from queue
                 await self._process_tasks()
 
-                # 4. Update dashboard task tracking
+                # 5. Update dashboard task tracking
                 self.dashboard.update_scheduler_tasks(self.tasks)
 
-                # 5. Sleep until next check
+                # 6. Sleep until next check
                 await asyncio.sleep(check_interval)
 
             except asyncio.CancelledError:
@@ -346,6 +344,30 @@ class TraderScheduler:
             self.tasks[trader_id]['processing'] = False
             # Update dashboard task tracking
             self.dashboard.update_scheduler_tasks(self.tasks)
+
+    async def _check_stuck_tasks(self):
+        """Check for and clean up stuck tasks
+
+        Tasks running longer than the timeout are marked as not processing
+        to allow new tasks to be queued.
+        """
+        task_timeout = self.config.get_int('scheduler.task_timeout_minutes', 10)
+        timeout_seconds = task_timeout * 60
+
+        current_time = datetime.now()
+
+        for trader_id, info in self.tasks.items():
+            if info.get('processing', False):
+                # Check when the task was last triggered
+                last_trigger = info.get('last_trigger')
+
+                if last_trigger and (current_time - last_trigger).total_seconds() > timeout_seconds:
+                    self.dashboard.log(
+                        f"{trader_id} task timeout ({task_timeout} min), clearing processing flag",
+                        "warning"
+                    )
+                    # Clear processing flag to allow new tasks
+                    self.tasks[trader_id]['processing'] = False
 
     async def _execute_decision(self, trader_id: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a decision for a trader

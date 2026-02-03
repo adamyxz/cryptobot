@@ -71,10 +71,10 @@ class SchedulerDashboard:
     """Live dashboard for scheduler monitoring
 
     Features:
-    - Fixed window with trader status table at top
-    - Continuous log stream below
+    - Fixed window with trader status table
     - Auto-refresh
-    - Ctrl+C to exit
+    - Can be embedded in a larger layout
+    - Supports paused/running state
     """
 
     def __init__(self, trader_db, position_db):
@@ -88,24 +88,28 @@ class SchedulerDashboard:
         self.position_db = position_db
         self.console = Console()
 
-        # Log storage (keep last 100 entries)
-        self.logs: deque[LogEntry] = deque(maxlen=100)
-
         # Decision results storage (trader_id -> last result)
         self.decision_results: Dict[str, Dict[str, Any]] = {}
 
         # Optimization time tracking (trader_id -> last optimize time)
         self.last_optimize_times: Dict[str, datetime] = {}
 
-        # Running state
-        self.running = False
-        self.live: Optional[Live] = None
-
         # Trader IDs being monitored
         self.monitored_trader_ids: List[str] = []
 
         # Task tracking (shared with scheduler)
         self.scheduler_tasks: Dict[str, Dict] = {}
+
+        # Scheduler running state
+        self.scheduler_running = False
+
+    def set_scheduler_running(self, running: bool):
+        """Set the scheduler running state
+
+        Args:
+            running: True if scheduler is running, False otherwise
+        """
+        self.scheduler_running = running
 
     def set_monitored_traders(self, trader_ids: List[str]):
         """Set the list of traders to monitor
@@ -125,115 +129,6 @@ class SchedulerDashboard:
                 }
             if trader_id not in self.last_optimize_times:
                 self.last_optimize_times[trader_id] = None
-
-    def log(self, message: str, level: str = "info", detail_lines: List[str] = None, trader_id: str = None):
-        """Add a log entry
-
-        Args:
-            message: Log message
-            level: Log level (info, warning, error, success, decide, optimize, trigger, thinking)
-            detail_lines: Optional list of detail lines to display
-            trader_id: Optional trader ID for filtering
-        """
-        self.logs.append(LogEntry(message, level, detail_lines=detail_lines, trader_id=trader_id))
-
-    def log_decision_start(self, trader_id: str, trigger_type: str = "manual"):
-        """Log the start of a decision process
-
-        Args:
-            trader_id: Trader ID
-            trigger_type: What triggered this decision (manual, scheduler, trigger)
-        """
-        self.log(f"{trader_id} deciding...", "decide", trader_id=trader_id)
-
-    def log_decision_thinking(self, trader_id: str, phase1_thinking: str = None,
-                             phase2_thinking: str = None, indicator_data: Dict = None,
-                             market_context: Dict = None):
-        """Log detailed decision thinking process
-
-        Args:
-            trader_id: Trader ID
-            phase1_thinking: Phase 1 thinking (initial analysis)
-            phase2_thinking: Phase 2 thinking (final decision analysis)
-            indicator_data: Technical indicators used
-            market_context: Market context data
-        """
-        detail_lines = []
-
-        # Add indicators summary
-        if indicator_data:
-            detail_lines.append("[cyan]Indicators:[/cyan]")
-            for key, value in indicator_data.items():
-                if isinstance(value, dict):
-                    # Handle nested indicator data
-                    value_str = ", ".join(f"{k}: {v}" for k, v in value.items())
-                    detail_lines.append(f"  • {key}: {value_str}")
-                else:
-                    detail_lines.append(f"  • {key}: {value}")
-
-        # Add market context summary
-        if market_context:
-            if 'price' in market_context:
-                detail_lines.append(f"[cyan]Price:[/cyan] ${market_context.get('price', 'N/A')}")
-            if 'volume_24h' in market_context:
-                detail_lines.append(f"[cyan]Volume (24h):[/cyan] ${market_context.get('volume_24h', 'N/A')}")
-
-        # Add phase 1 thinking (truncated for readability)
-        if phase1_thinking:
-            thinking_preview = self._truncate_text(phase1_thinking, max_lines=3, max_chars=200)
-            detail_lines.append(f"[blue]Initial Analysis:[/blue]")
-            detail_lines.append(f"  {thinking_preview}")
-
-        # Add phase 2 thinking (truncated for readability)
-        if phase2_thinking:
-            thinking_preview = self._truncate_text(phase2_thinking, max_lines=3, max_chars=200)
-            detail_lines.append(f"[blue]Decision Analysis:[/blue]")
-            detail_lines.append(f"  {thinking_preview}")
-
-        if detail_lines:
-            self.log(f"{trader_id} AI thinking process", "thinking", detail_lines=detail_lines, trader_id=trader_id)
-
-    def log_decision_complete(self, trader_id: str, decision: str, phase1_thinking: str = None,
-                             phase2_thinking: str = None):
-        """Log the completion of a decision
-
-        Args:
-            trader_id: Trader ID
-            decision: The final decision
-            phase1_thinking: Phase 1 thinking (for summary)
-            phase2_thinking: Phase 2 thinking (for summary)
-        """
-        self.log(f"{trader_id} decision complete: {decision}", "success", trader_id=trader_id)
-
-    def _truncate_text(self, text: str, max_lines: int = 3, max_chars: int = 200) -> str:
-        """Truncate text to specified limits
-
-        Args:
-            text: Text to truncate
-            max_lines: Maximum number of lines
-            max_chars: Maximum number of characters
-
-        Returns:
-            Truncated text with ellipsis if needed
-        """
-        if not text:
-            return ""
-
-        # Split into lines
-        lines = text.split('\n')
-
-        # Take first N lines
-        truncated = '\n'.join(lines[:max_lines])
-
-        # Truncate by character count if still too long
-        if len(truncated) > max_chars:
-            truncated = truncated[:max_chars] + "..."
-
-        # Add ellipsis if we truncated lines
-        if len(lines) > max_lines:
-            truncated = truncated.rstrip() + "\n  ..."
-
-        return truncated.strip()
 
     def update_decision_result(self, trader_id: str, result: str, action: str):
         """Update the last decision result for a trader
@@ -275,6 +170,18 @@ class SchedulerDashboard:
         table.add_column("Last Optimize", justify="center", style="magenta", width=10)
         table.add_column("Positions", justify="center", style="white", width=8)
         table.add_column("Total PnL", justify="right", style="bold", width=12)
+
+        # If no traders, show a message
+        if not self.monitored_trader_ids:
+            table.add_row(
+                "[dim]No traders[/dim]",
+                "[dim]Use /start to begin[/dim]",
+                "",
+                "",
+                "",
+                ""
+            )
+            return table
 
         for trader_id in self.monitored_trader_ids:
             # Get decision result
@@ -355,90 +262,22 @@ class SchedulerDashboard:
 
         return table
 
-    def _build_log_panel(self) -> Panel:
-        """Build the log panel
+    def render(self) -> Panel:
+        """Render the dashboard as a Panel
 
         Returns:
-            Rich Panel with log entries
+            Rich Panel with trader status table
         """
-        if not self.logs:
-            log_text = Text("[dim]Waiting for logs...[/dim]", style="dim")
+        # Add status indicator to title
+        if self.scheduler_running:
+            status_text = "[green]●[/green] Running"
         else:
-            log_text = Text()
-            for entry in self.logs:
-                log_text.append(entry.to_rich_text())
-                log_text.append("\n")
+            status_text = "[dim]○[/dim] Stopped"
+
+        title = f"[bold cyan]Trader Monitor[/bold cyan] {status_text}"
 
         return Panel(
-            log_text,
-            title="[bold]Activity Log[/bold]",
-            border_style="dim",
-            height=15  # Fixed height for log area
-        )
-
-    def _generate_layout(self) -> Layout:
-        """Generate the main layout
-
-        Returns:
-            Rich Layout with table and logs
-        """
-        layout = Layout()
-
-        # Split vertically: table on top, logs on bottom
-        layout.split_column(
-            Layout(name="table", ratio=2),
-            Layout(name="logs", ratio=1)
-        )
-
-        # Add table
-        layout["table"].update(Panel(
             self._build_status_table(),
-            title="[bold cyan]Trader Monitor[/bold cyan]",
+            title=title,
             border_style="cyan"
-        ))
-
-        # Add logs
-        layout["logs"].update(self._build_log_panel())
-
-        return layout
-
-    async def start(self, refresh_interval: float = 1.0):
-        """Start the live dashboard
-
-        Args:
-            refresh_interval: Refresh interval in seconds
-        """
-        self.running = True
-
-        # Initial log
-        self.log("Dashboard started", "success")
-        self.log(f"Monitoring {len(self.monitored_trader_ids)} trader(s)", "info")
-        self.log("Press Ctrl+C to exit", "dim")
-
-        try:
-            with Live(
-                self._generate_layout(),
-                console=self.console,
-                refresh_per_second=1 / refresh_interval,
-                screen=False
-            ) as live:
-                self.live = live
-
-                while self.running:
-                    # Update the display
-                    live.update(self._generate_layout())
-
-                    # Wait for next refresh
-                    await asyncio.sleep(refresh_interval)
-
-        except KeyboardInterrupt:
-            self.log("\nReceived exit signal, stopping...", "warning")
-        finally:
-            self.running = False
-            self.live = None
-
-    def stop(self):
-        """Stop the dashboard"""
-        self.running = False
-        if self.live:
-            self.live.stop()
+        )

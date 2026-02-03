@@ -17,6 +17,7 @@ class SchedulerConfig:
         # Scheduler settings
         'scheduler.check_interval': ('30', 'int', 'Check interval in seconds'),
         'scheduler.max_concurrent_tasks': ('3', 'int', 'Maximum concurrent tasks'),
+        'scheduler.task_timeout_minutes': ('10', 'int', 'Task timeout in minutes'),
 
         # Trigger settings
         'trigger.time.enabled': ('true', 'bool', 'Enable time-based triggers'),
@@ -28,7 +29,7 @@ class SchedulerConfig:
         'indicator.exchange': ('okx', 'string', 'Default exchange for indicators (okx, binance, etc.)'),
 
         # Optimization settings
-        'optimize.enabled': ('true', 'bool', 'Enable automatic optimization'),
+        'optimize.enabled': ('false', 'bool', 'Enable automatic optimization'),
         'optimize.min_positions': ('5', 'int', 'Minimum positions before optimization'),
         'optimize.interval_hours': ('24', 'int', 'Optimization interval in hours'),
 
@@ -89,6 +90,15 @@ class SchedulerConfig:
                     VALUES (?, ?, ?, ?)
                 """, (key, default_value, value_type, description))
 
+        self.conn.commit()
+
+        # Force disable auto-optimization (it causes UI issues)
+        # Users can manually enable it via /config if needed
+        cursor.execute("""
+            UPDATE scheduler_config
+            SET value = 'false'
+            WHERE key = 'optimize.enabled'
+        """)
         self.conn.commit()
 
     def get(self, key: str, default: Any = None) -> Any:

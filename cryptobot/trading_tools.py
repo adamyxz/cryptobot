@@ -109,6 +109,13 @@ class TradingTools:
                 error=str(e)
             )
 
+        # Check if using configured default exchange
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        configured_exchange = config.get_string('indicator.exchange', 'okx')
+        if exchange != configured_exchange:
+            self.console.print(f"[yellow]⚠ Warning: Using exchange '{exchange}' instead of configured default '{configured_exchange}'[/yellow]")
+
         # Verify trader exists
         trader = self.trader_db.get_trader(trader_id)
         if not trader:
