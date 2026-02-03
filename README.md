@@ -1,23 +1,29 @@
 # CryptoBot
 
-A modern cryptocurrency trading CLI tool for accessing perpetual futures (perpetual swaps) market data from multiple exchanges using CCXT.
+A modern cryptocurrency trading CLI tool for perpetual futures with AI-powered strategy generation, position management, and automated scheduling.
 
 ## Features
 
-- **Historical Data**: REST API access to historical candlestick data
-- **Multiple Exchanges**: Support for Binance, OKX, Bybit, and Bitget
-- **Perpetual Futures**: Focus on perpetual swap markets (not spot)
+- **Multi-Exchange Support**: Binance, OKX, Bybit, Bitget via CCXT
+- **Perpetual Futures Focus**: Full support for leverage, long/short positions, funding rates
+- **AI-Powered Trader Generation**: Create unique, diverse trading strategy profiles
+- **Position Management**: Full lifecycle management with P&L tracking
+- **Automated Scheduling**: Run multiple traders with configurable monitoring intervals
+- **Liquidation Monitoring**: Real-time alerts for position liquidation events
+- **Indicator System**: Modular market data collection with CSV output
 - **Rich Visualizations**: Beautiful terminal charts and tables
-- **Trader Management**: AI-powered trading strategy profile generation
 
 ## Installation
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/adamyxz/cryptobot.git
 cd cryptobot
 
-# Install dependencies
+# Install with uv (recommended)
+uv pip install -e .
+
+# Or with pip
 pip install -e .
 ```
 
@@ -33,44 +39,92 @@ cryptobot
 
 ## Commands
 
-### Data Commands
+### Core Commands
 
-- `/rest [exchange] [symbol] [interval] [limit]` - Fetch historical K-line data (REST API)
-- `/pairs [exchange]` - List available perpetual futures trading pairs
-- `/intervals` - Show supported time intervals
+| Command | Description |
+|---------|-------------|
+| `/start [trader_ids...]` | Start automated scheduler (optionally specify traders) |
+| `/stop` | Stop the scheduler |
+| `/status` | View scheduler status and active positions |
+| `/config [key] [value]` | View/modify configuration |
 
-### Trader Commands
+### Market Data
 
-- `/traders [id] [prompt]` - View/modify trader profiles
-- `/traders [id] -d` - Delete a trader profile
-- `/newtrader [prompt]` - Generate new AI-powered trader profile
+| Command | Description |
+|---------|-------------|
+| `/market [exchange] [symbol] [interval] [limit]` | Get historical K-line data |
+| `/pairs [exchange]` | List available perpetual futures pairs |
+| `/intervals` | Show supported time intervals |
 
-### System Commands
+### Trader Management
 
-- `/help` - Show help information
-- `/quit` or `/exit` - Exit the program
+| Command | Description |
+|---------|-------------|
+| `/traders -a [prompt] [-t <count>]` | Generate new AI trader profile(s) |
+| `/traders [trader_id ...]` | View trader profiles |
+| `/traders <id> -m <prompt>` | Modify existing trader |
+| `/traders <id> -d` | Delete trader profile |
+| `/decide <trader_id>` | Get AI trading decision for a trader |
+
+### Position Management
+
+| Command | Description |
+|---------|-------------|
+| `/positions [trader_id|position_id]` | View positions |
+| `/positions <trader_id> -o <params>` | Open new position |
+| `/positions <position_id> -c [price]` | Close position |
+
+### Indicator System
+
+| Command | Description |
+|---------|-------------|
+| `/indicators -a <prompt>` | Generate new indicator script |
+| `/indicators [filename]` | View indicator code |
+| `/indicators <name> -d` | Delete indicator |
+| `/indicators <name> -t <args...>` | Test indicator |
+| `/indicators <name> -m <prompt>` | Modify indicator |
+
+### Other
+
+| Command | Description |
+|---------|-------------|
+| `/optimize <trader_id>` | AI self-optimization for trader |
+| `/help` | Show detailed help |
+| `/quit` or `/exit` | Exit program |
 
 ## Examples
 
 ```bash
-# Get historical data for BTCUSDT on Binance (default: 30 candles)
-/rest
+# Start scheduler with specific traders
+/start 1 2 3
 
-# Get historical data for ETHUSDT on OKX (100 candles)
-/rest okx ETHUSDT 1h 100
+# Get market data
+/market okx ETHUSDT 1h 100
 
-# Show all perpetual futures pairs on Bitget
-/pairs bitget
+# Generate a new aggressive scalper trader
+/traders -a Create an aggressive scalper focusing on BTC with high frequency
+
+# Get AI decision for trader #5
+/decide 5
+
+# Open a long position
+/positions 5 -o symbol=BTCUSDT side=long entry=45000 quantity=0.1 leverage=2
+
+# Generate a funding rate indicator
+/indicators -a Create an indicator that fetches funding rate history
+
+# View all positions
+/positions
 ```
 
 ## Supported Exchanges
 
-| Exchange | CCXT Class | Market Type | Example Symbol |
-|----------|------------|-------------|----------------|
-| Binance | `binanceusdm` | Perpetual Futures | `BTCUSDT` |
-| OKX | `okx` | Perpetual Swaps | `BTCUSDT` |
-| Bybit | `bybit` | Derivatives | `BTCUSDT` |
-| Bitget | `bitget` | Futures | `BTCUSDT` |
+| Exchange | CCXT Class | Market Type |
+|----------|------------|-------------|
+| Binance | `binanceusdm` | Perpetual Futures |
+| OKX | `okx` | Perpetual Swaps |
+| Bybit | `bybit` | Derivatives |
+| Bitget | `bitget` | Futures |
 
 ## Supported Intervals
 
@@ -78,52 +132,106 @@ cryptobot
 - **Hours**: `1h`, `2h`, `4h`, `6h`, `12h`
 - **Days/Weeks/Months**: `1d`, `1w`, `1M`
 
-## Data Source
-
-All market data is sourced from **perpetual futures** (perpetual swaps) markets, not spot markets. This provides:
-
-- Higher liquidity
-- Lower spreads
-- Better for short-term trading strategies
-- Access to advanced order types
-
-## Architecture
-
-The CLI is built on top of:
-
-- **CCXT**: Unified cryptocurrency exchange API
-- **Rich**: Terminal formatting and visualization
-- **Prompt Toolkit**: Interactive command-line interface
-
 ## Project Structure
 
 ```
 cryptobot/
-├── cryptobot/
+├── cryptobot/              # Main package
 │   ├── __init__.py
-│   ├── cli.py              # Main CLI logic
-│   ├── exchanges.py        # Exchange interface (legacy compatibility)
-│   ├── ccxt_adapter.py     # CCXT integration module
-│   ├── display.py          # Visualization layer
-│   └── trader_db.py        # Trader profile database
-├── traders/                # Trader profile storage
-│   ├── TRADERS.md          # Trader profile template
-│   ├── TraderName_1/       # Individual trader folder
-│   │   └── profile.md      # Trader profile document
-│   └── TraderName_2/       # Another trader
-│       └── profile.md
-├── tests/                  # Test suite
+│   ├── __main__.py         # Entry point
+│   ├── cli.py              # CLI core logic
+│   ├── ccxt_adapter.py     # CCXT integration
+│   ├── display.py          # Visualization
+│   ├── exchanges.py        # Exchange interface
+│   ├── trader_db.py        # Trader profile database
+│   ├── position_db.py      # Position database
+│   ├── position.py         # Position models
+│   ├── fees.py             # Fee calculation
+│   ├── scheduler.py        # Task scheduler
+│   ├── scheduler_config.py # Scheduler configuration
+│   ├── scheduler_dashboard.py # Scheduler UI
+│   ├── trading_tools.py    # Trading utilities
+│   ├── activity_log_db.py  # Activity logging
+│   ├── liquidation_monitor.py # Liquidation monitoring
+│   ├── price_service.py    # Real-time price service
+│   ├── priority_queue.py   # Priority queue
+│   └── triggers/           # Trigger system
+│       ├── base.py
+│       ├── price_trigger.py
+│       ├── time_trigger.py
+│       └── trigger_manager.py
+├── indicators/             # Indicator scripts
+│   ├── __init__.py
+│   ├── base.py
+│   ├── fetch_open_interest.py
+│   ├── fetch_orderbook.py
+│   ├── fundingratehistory.py
+│   ├── longshortratio.py
+│   ├── market_data.py
+│   └── INDICATORS.md       # Indicator development guide
+├── traders/                # Trader profiles (gitignored)
+│   └── TRADERS.md          # Trader generation guide
+├── main.py                 # Alternative entry point
 ├── pyproject.toml          # Project configuration
 └── README.md              # This file
 ```
 
 ## Configuration
 
-No configuration file required. The CLI uses sensible defaults:
+Configuration is stored in `~/.cryptobot/config.json`:
 
-- Default exchange: `binance`
-- Default symbol: `BTCUSDT`
-- Default interval: `1m`
+```json
+{
+  "scheduler": {
+    "check_interval_minutes": 5,
+    "decide_command": "/decide {trader_id}"
+  },
+  "indicator": {
+    "exchange": "okx",
+    "symbol": "BTCUSDT",
+    "interval": "1m",
+    "limit": 100
+  }
+}
+```
+
+Modify using `/config <key> <value>` in the CLI.
+
+## Trader System
+
+Traders are AI-generated strategy profiles that define:
+- Entry/exit conditions
+- Risk management rules
+- Position sizing and leverage
+- Asset preferences and timeframes
+- Trading philosophy and psychology
+
+All traders support **perpetual futures** with both LONG and SHORT positions.
+
+### Creating Traders
+
+```bash
+# Generate a single trader
+/traders -a Create a momentum-based day trader for altcoins
+
+# Generate multiple traders at once
+/traders -a Generate diverse arbitrage strategies -t 3
+```
+
+## Position Management
+
+Positions include full lifecycle tracking:
+- Real-time P&L calculation
+- Liquidation monitoring with alerts
+- Funding rate tracking
+- Fee calculation
+- Status management (OPEN, CLOSED, LIQUIDATED)
+
+## Indicator System
+
+Indicators are modular Python scripts that fetch market data in CSV format. They are used by the `/decide` command to gather additional context for AI decision-making.
+
+See `indicators/INDICATORS.md` for detailed development guidelines.
 
 ## Requirements
 
@@ -134,15 +242,11 @@ No configuration file required. The CLI uses sensible defaults:
 
 ## License
 
-[Add your license here]
+MIT License - see LICENSE file for details
 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Migration Notes
-
-This project has been migrated from direct exchange APIs to CCXT. See `MIGRATION_SUMMARY.md` for detailed information about the migration.
 
 ## Support
 
