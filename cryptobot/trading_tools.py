@@ -244,8 +244,13 @@ class TradingTools:
         # Get close price
         if price is None:
             try:
+                # Get configured exchange from config
+                from .scheduler_config import get_scheduler_config
+                config = get_scheduler_config()
+                configured_exchange = config.get_string('indicator.exchange', 'okx')
+
                 price_service = get_price_service()
-                price = await price_service.fetch_current_price(position.exchange, position.symbol)
+                price = await price_service.fetch_current_price(configured_exchange, position.symbol)
             except Exception as e:
                 return PositionResult(
                     success=False,
@@ -254,8 +259,13 @@ class TradingTools:
                 )
 
         try:
+            # Get configured exchange from config for fee calculation
+            from .scheduler_config import get_scheduler_config
+            config = get_scheduler_config()
+            configured_exchange = config.get_string('indicator.exchange', 'okx')
+
             # Calculate exit fee
-            exit_fee = calculate_fee(position.exchange, position.position_size, price)
+            exit_fee = calculate_fee(configured_exchange, position.position_size, price)
 
             # Use position_db's close_position method to handle the closing
             success = self.position_db.close_position(position_id, price, exit_fee)
@@ -271,12 +281,16 @@ class TradingTools:
             updated_position = self.position_db.get_position(position_id)
             pnl = updated_position.realized_pnl if updated_position else 0.0
 
-            # Update trader balance and equity
+            # Update trader balance (equity will be updated with unrealized PnL separately)
             self.trader_db.update_balance_and_equity(
                 position.trader_id,
-                balance_change=position.margin + pnl,
-                equity_change=pnl
+                balance_change=position.margin + pnl
             )
+
+            # Update equity with current unrealized PnL (should be 0 for closed positions)
+            # Get fresh summary to ensure we have the latest unrealized PnL
+            summary = self.position_db.get_trader_positions_summary(position.trader_id)
+            self.trader_db.update_equity_with_unrealized_pnl(position.trader_id, summary['total_unrealized_pnl'])
 
             self.console.print(f"[green]✓ Position closed via AI tool call[/green]")
             self.console.print(f"  [dim]ID: {position_id}[/dim]")

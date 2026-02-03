@@ -25,6 +25,7 @@ class SchedulerConfig:
 
         # Indicator settings
         'indicator.limit': ('0', 'int', 'Indicator data limit (0 = unlimited)'),
+        'indicator.exchange': ('okx', 'string', 'Default exchange for indicators (okx, binance, etc.)'),
 
         # Optimization settings
         'optimize.enabled': ('true', 'bool', 'Enable automatic optimization'),

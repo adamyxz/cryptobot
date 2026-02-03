@@ -992,13 +992,13 @@ class TraderDatabase:
         cursor.execute("SELECT * FROM intervals ORDER BY seconds")
         return [dict(row) for row in cursor.fetchall()]
 
-    def add_trader_pairs(self, trader_id: str, pair_symbols: List[str], exchange: str = 'binance'):
+    def add_trader_pairs(self, trader_id: str, pair_symbols: List[str], exchange: str = None):
         """Associate pairs with a trader
 
         Args:
             trader_id: Trader ID
             pair_symbols: List of pair symbols (e.g., ['BTCUSDT', 'ETHUSDT'])
-            exchange: Exchange name (default: 'binance')
+            exchange: Exchange name (default: from config, usually 'okx')
 
         Raises:
             ValueError: If total pairs exceed maximum allowed
@@ -1006,10 +1006,13 @@ class TraderDatabase:
         if not self.conn:
             self.initialize()
 
-        # Validate pairs count against config
-        from .scheduler_config import get_scheduler_config
+        # Get default exchange from config if not provided
+        if exchange is None:
+            from .scheduler_config import get_scheduler_config
+            config = get_scheduler_config(self.db_path)
+            exchange = config.get_string('indicator.exchange', 'okx')
 
-        config = get_scheduler_config(self.db_path)
+        # Validate pairs count against config
         max_pairs = config.get_int('trader.pairs.max', 10)
 
         # Get existing pairs count

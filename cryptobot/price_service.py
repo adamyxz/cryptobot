@@ -99,6 +99,11 @@ class PriceUpdateService:
         Raises:
             RuntimeError: If fetching prices or updating fails
         """
+        # Get configured exchange from config
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        configured_exchange = config.get_string('indicator.exchange', 'okx')
+
         # Get all open positions for the trader
         positions = db.list_positions(trader_id, status='open')
 
@@ -111,19 +116,20 @@ class PriceUpdateService:
         price_cache: Dict[tuple, float] = {}
 
         for position in positions:
-            cache_key = (position.exchange, position.symbol)
+            # Use configured exchange instead of position's saved exchange
+            cache_key = (configured_exchange, position.symbol)
 
             # Fetch price if not already cached
             if cache_key not in price_cache:
                 try:
                     current_price = await self.fetch_current_price(
-                        position.exchange,
+                        configured_exchange,
                         position.symbol
                     )
                     price_cache[cache_key] = current_price
                 except Exception as e:
                     # Log error but continue with other positions
-                    print(f"Warning: Failed to fetch price for {position.exchange} {position.symbol}: {e}")
+                    print(f"Warning: Failed to fetch price for {configured_exchange} {position.symbol}: {e}")
                     continue
 
             current_price = price_cache[cache_key]
@@ -155,6 +161,11 @@ class PriceUpdateService:
         Returns:
             Updated Position object or None if failed
         """
+        # Get configured exchange from config
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        configured_exchange = config.get_string('indicator.exchange', 'okx')
+
         position = db.get_position(position_id)
 
         if not position or position.status != 'open':
@@ -162,7 +173,7 @@ class PriceUpdateService:
 
         try:
             current_price = await self.fetch_current_price(
-                position.exchange,
+                configured_exchange,
                 position.symbol
             )
 

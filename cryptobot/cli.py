@@ -49,7 +49,6 @@ class CryptoBot:
     Manages user interaction and data display
     """
 
-    DEFAULT_EXCHANGE = "binance"
     DEFAULT_SYMBOL = "BTCUSDT"
     DEFAULT_INTERVAL = "1m"
 
@@ -67,6 +66,11 @@ class CryptoBot:
 
     def _print_banner(self):
         """Print welcome banner"""
+        # Get default exchange from config
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        default_exchange = config.get_string('indicator.exchange', 'okx')
+
         banner = """
 [bold cyan]╔═══════════════════════════════════════════════════════════╗
 ║                    CryptoBot v0.1.0                          ║
@@ -97,7 +101,7 @@ class CryptoBot:
 [dim]Tip: Enter /help for detailed command information[/dim]
 """.format(
             exchanges=", ".join(get_supported_exchanges()),
-            default_exchange=self.DEFAULT_EXCHANGE,
+            default_exchange=default_exchange,
             default_symbol=self.DEFAULT_SYMBOL,
             default_interval=self.DEFAULT_INTERVAL,
         )
@@ -105,6 +109,11 @@ class CryptoBot:
 
     def _print_help(self):
         """Display help information"""
+        # Get default exchange from config
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        default_exchange = config.get_string('indicator.exchange', 'okx')
+
         help_text = """
 [bold cyan]════════════════════════════════════════════════════════════════════════════════
                               CryptoBot Command Help
@@ -369,7 +378,7 @@ class CryptoBot:
 [dim]Tip: Press Ctrl+C to stop current operation[/dim]
 """.format(
             exchanges=", ".join(get_supported_exchanges()),
-            default_exchange=self.DEFAULT_EXCHANGE,
+            default_exchange=default_exchange,
             default_symbol=self.DEFAULT_SYMBOL,
             default_interval=self.DEFAULT_INTERVAL,
         )
@@ -408,8 +417,13 @@ class CryptoBot:
         Args:
             args: Command arguments
         """
+        # Get default exchange from config
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        default_exchange = config.get_string('indicator.exchange', 'okx')
+
         # Parse parameters
-        exchange = args[0] if len(args) > 0 else self.DEFAULT_EXCHANGE
+        exchange = args[0] if len(args) > 0 else default_exchange
         symbol = args[1] if len(args) > 1 else self.DEFAULT_SYMBOL
         interval = args[2] if len(args) > 2 else self.DEFAULT_INTERVAL
         limit_str = args[3] if len(args) > 3 else "30"
@@ -497,7 +511,12 @@ class CryptoBot:
         Args:
             args: Command arguments
         """
-        exchange = args[0] if len(args) > 0 else self.DEFAULT_EXCHANGE
+        # Get default exchange from config
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        default_exchange = config.get_string('indicator.exchange', 'okx')
+
+        exchange = args[0] if len(args) > 0 else default_exchange
 
         # Validate exchange
         try:
@@ -2451,9 +2470,9 @@ If test files are created during testing, clean them up after tests pass."""
         }
 
         try:
-            # Phase 1: Gather data
+            # Phase 1: Gather trader data and let AI select indicators
             if verbose:
-                self.console.print(f"[Phase 1] collecttrader {trader_id} data...")
+                self.console.print(f"[Phase 1] Analyzing trader {trader_id} and selecting indicators...")
 
             # Get trader profile
             with TraderDatabase() as db:
@@ -2488,7 +2507,7 @@ If test files are created during testing, clean them up after tests pass."""
                 summary = pos_db.get_trader_positions_summary(trader_id)
             except Exception as e:
                 if verbose:
-                    self.console.print(f"[Warning] Cannotmorenewprice: {e}")
+                    self.console.print(f"[Warning] Cannot update price: {e}")
 
             # Build decision context
             decision_context = self._build_decision_context(trader, open_positions, summary, profile_content)
@@ -2499,20 +2518,7 @@ If test files are created during testing, clean them up after tests pass."""
                 'summary': summary
             }
 
-            # Phase 2: Auto-fetch indicators based on trader profile (Code-level certainty)
-            if verbose:
-                self.console.print("[Phase 2] Auto-fetching market data based on trader profile...")
-            indicator_data = await self._auto_fetch_indicators(trader, verbose=verbose)
-
-            if verbose and indicator_data:
-                self.console.print(f"[completed] auto-fetched {len(indicator_data)} indicator(s): {list(indicator_data.keys())}")
-
-            log_data['indicator_data'] = indicator_data
-            log_data['market_context'] = decision_context.get('market_data', {})
-
-            # Phase 3: AI initial assessment (now with auto-fetched data available)
-            if verbose:
-                self.console.print("[Phase 3] AI initial analysis...")
+            # Phase 1 (continued): AI selects indicators based on trader profile
             phase1_prompt = self._build_phase1_prompt(decision_context)
             phase1_response = await self._call_claude_code_for_decision(phase1_prompt, trader_id)
 
@@ -2520,7 +2526,7 @@ If test files are created during testing, clean them up after tests pass."""
             log_data['phase1_response'] = phase1_response
 
             if not phase1_response or phase1_response.startswith("ERROR"):
-                self.console.print(f"[Error] AI callingfailed: {phase1_response}")
+                self.console.print(f"[Error] AI call failed: {phase1_response}")
                 log_data['status'] = 'ERROR'
                 log_data['error_message'] = phase1_response
                 log_data['execution_time_ms'] = (time.time() - start_time) * 1000
@@ -2530,42 +2536,94 @@ If test files are created during testing, clean them up after tests pass."""
                     'thinking': False,
                     'phase1_thinking': None,
                     'phase2_thinking': None,
-                    'indicator_data': log_data.get('indicator_data'),
-                    'market_context': log_data.get('market_context'),
+                    'indicator_data': None,
+                    'market_context': None,
                     'positions_context': log_data.get('positions_context'),
                     'error': phase1_response
                 }
 
-            # Parse phase1 response to extract thinking and decision
-            phase1_thinking, phase1_decision = self._parse_ai_response(phase1_response)
-            log_data['phase1_thinking'] = phase1_thinking
+            # Parse AI's indicator selection
+            selected_indicators = self._parse_indicator_selection(phase1_response)
 
-            # Show brief summary of AI response
-            if verbose:
-                if phase1_thinking:
-                    # Show first few lines of thinking
-                    thinking_lines = phase1_thinking.split('\n')[:3]
-                    self.console.print(f"[AI thinking] {' '.join(thinking_lines)[:150]}...")
-                decision_preview = phase1_decision if phase1_decision else (phase1_response[:100] if phase1_response else '')
-                self.console.print(f"[AI decision] {decision_preview}")
-
-            # Phase 4: Fetch additional indicators if AI explicitly requests them
-            response_upper = phase1_response.upper()
-            if "NEED_INDICATOR" in response_upper or "NEED_ORDERBOOK" in response_upper or "NEED_MARKET" in response_upper or "NEED_BOTH" in response_upper:
+            if not selected_indicators:
                 if verbose:
-                    self.console.print("[Phase 4] Fetching additional requested data...")
-                additional_data = await self._execute_indicators_from_response(phase1_response, trader)
+                    self.console.print("[Warning] AI did not select any indicators, using defaults...")
+                # Fallback to basic market_data
+                selected_indicators = [
+                    ('market_data.py', {'exchange': 'binance', 'symbol': trader['trading_pairs'][0] if trader['trading_pairs'] else 'BTCUSDT', 'interval': trader['timeframes'][0] if trader['timeframes'] else '1h'})
+                ]
 
-                if verbose and additional_data:
-                    self.console.print(f"[completed] fetched {len(additional_data)} additional indicator(s): {list(additional_data.keys())}")
-
-                # Merge with existing indicator data
-                indicator_data.update(additional_data)
-                log_data['indicator_data'] = indicator_data
-
-            # Phase 5: Final decision
             if verbose:
-                self.console.print("[Phase 5] Making final decision...")
+                indicator_names = [name.replace('.py', '') for name, _ in selected_indicators]
+                self.console.print(f"[AI selected indicators: {', '.join(indicator_names)}]")
+
+            # Phase 2: Execute selected indicators
+            if verbose:
+                self.console.print("[Phase 2] Fetching selected market data...")
+
+            indicator_data = {}
+            for script_name, args in selected_indicators:
+                # Ensure .py extension
+                if not script_name.endswith('.py'):
+                    script_name = script_name + '.py'
+
+                # Normalize symbol - ensure it has proper suffix
+                if 'symbol' in args:
+                    symbol = args['symbol']
+                    symbol_upper = symbol.upper()
+                    # Add USDT suffix if missing and symbol looks like a crypto base
+                    if not symbol_upper.endswith('USDT') and not symbol_upper.endswith('USDC') and not symbol_upper.endswith('BUSD'):
+                        # Check if it's a common crypto symbol (short, alphanumeric)
+                        if len(symbol_upper) <= 10 and symbol_upper.isalnum():
+                            args['symbol'] = symbol_upper + 'USDT'
+
+                # Build command line arguments
+                cmd_args = []
+                for key, value in args.items():
+                    if value is True:
+                        cmd_args.append(f'--{key}')
+                    else:
+                        cmd_args.extend([f'--{key}', str(value)])
+
+                # Apply config settings: exchange and limit
+                from .scheduler_config import get_scheduler_config
+                config = get_scheduler_config()
+
+                # Force use configured exchange, override AI's choice
+                configured_exchange = config.get_string('indicator.exchange', 'okx')
+                # Remove existing --exchange if present, then use config value
+                cmd_args = [arg for i, arg in enumerate(cmd_args) if not (arg == '--exchange' or (i > 0 and cmd_args[i-1] == '--exchange'))]
+                cmd_args.extend(["--exchange", configured_exchange])
+
+                # Add limit if configured and script supports it
+                limit_config = config.get_int('indicator.limit', 0)
+                if limit_config > 0 and self._script_has_limit_param(script_name):
+                    # Remove existing --limit if present, then use config value
+                    cmd_args = [arg for i, arg in enumerate(cmd_args) if not (arg == '--limit' or (i > 0 and cmd_args[i-1] == '--limit'))]
+                    cmd_args.extend(["--limit", str(limit_config)])
+
+                if verbose:
+                    print(f"[indicator] running {script_name}: {' '.join(cmd_args)}")
+
+                try:
+                    data = await self._run_indicator(script_name, cmd_args)
+                    if data and not data.startswith("error"):
+                        indicator_data[script_name.replace('.py', '')] = data
+                    elif verbose:
+                        self.console.print(f"[Warning] {script_name} failed or returned error")
+                except Exception as e:
+                    if verbose:
+                        self.console.print(f"[Warning] Error running {script_name}: {e}")
+
+            if verbose and indicator_data:
+                self.console.print(f"[completed] fetched {len(indicator_data)} indicator(s): {list(indicator_data.keys())}")
+
+            log_data['indicator_data'] = indicator_data
+            log_data['market_context'] = decision_context.get('market_data', {})
+
+            # Phase 3: AI makes final decision based on indicator data
+            if verbose:
+                self.console.print("[Phase 3] AI making final decision...")
             phase2_prompt = self._build_phase2_prompt(decision_context, indicator_data, phase1_response)
             phase2_response = await self._call_claude_code_for_decision(phase2_prompt, trader_id)
 
@@ -2737,6 +2795,117 @@ If test files are created during testing, clean them up after tests pass."""
 
         return thinking, action_code
 
+    def _parse_indicator_selection(self, response: str) -> list:
+        """Parse AI response to extract selected indicators
+
+        Args:
+            response: AI response string containing SELECTED_INDICATORS section
+
+        Returns:
+            List of tuples: [(script_name, {arg_key: arg_value, ...}), ...]
+        """
+        import re
+
+        if not response:
+            return []
+
+        # Try to extract SELECTED_INDICATORS section
+        selection_match = re.search(r'\*\*SELECTED_INDICATORS:\*\*\s*(.*?)(?=\*\*|\Z)', response, re.DOTALL | re.IGNORECASE)
+        if not selection_match:
+            selection_match = re.search(r'SELECTED_INDICATORS:\s*(.*?)(?=\*\*|\Z)', response, re.DOTALL | re.IGNORECASE)
+
+        if not selection_match:
+            return []
+
+        selection_text = selection_match.group(1).strip()
+        if not selection_text:
+            return []
+
+        # Parse each line as an indicator request
+        indicators = []
+        for line in selection_text.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('**'):
+                continue
+
+            # Remove bullet points and numbering
+            line = re.sub(r'^[\-\*\d+\.\)]+\s*', '', line)
+
+            # Split into parts
+            parts = line.split()
+            if not parts or len(parts) < 1:
+                continue
+
+            # First part is the script name - validate it
+            script_name = parts[0]
+
+            # Skip invalid entries
+            invalid_names = ['these', 'those', 'following', 'below', '-', '—', '•', 'indicators', 'selected']
+            if script_name.lower() in invalid_names:
+                continue
+
+            # Script name should end with .py or be a known indicator name
+            if not script_name.endswith('.py'):
+                # Try to match against known indicators
+                known_indicators = ['market_data', 'fetch_orderbook', 'fundingratehistory',
+                                   'fetch_open_interest', 'longshortratio', 'base']
+                matched = None
+                for known in known_indicators:
+                    if known in script_name.lower() or script_name.lower() in known:
+                        matched = known + '.py'
+                        break
+                if matched:
+                    script_name = matched
+                else:
+                    # Not a valid indicator, skip
+                    continue
+
+            # Parse arguments into dict
+            args = {}
+            i = 1
+            while i < len(parts):
+                part = parts[i]
+
+                # Stop if we hit invalid text
+                if part.lower() in ['-', '—', '→', 'for', 'and', 'with', '→']:
+                    break
+
+                # Check if this is a parameter (starts with -- or -)
+                if part.startswith('--'):
+                    key = part[2:].strip()
+                    if i + 1 < len(parts) and not parts[i + 1].startswith('-'):
+                        value = parts[i + 1].strip()
+                        # Skip if value looks like invalid text
+                        if value.lower() not in ['→', 'for', 'and', 'with']:
+                            args[key] = value
+                            i += 2
+                        else:
+                            args[key] = True
+                            i += 1
+                    else:
+                        args[key] = True
+                        i += 1
+                elif part.startswith('-'):
+                    key = part[1:].strip()
+                    if i + 1 < len(parts) and not parts[i + 1].startswith('-'):
+                        value = parts[i + 1].strip()
+                        if value.lower() not in ['→', 'for', 'and', 'with']:
+                            args[key] = value
+                            i += 2
+                        else:
+                            args[key] = True
+                            i += 1
+                    else:
+                        args[key] = True
+                        i += 1
+                else:
+                    # Positional argument - skip unknown text
+                    i += 1
+
+            indicators.append((script_name, args))
+
+        return indicators
+
     async def _execute_action_code(self, code: str, trader_id: str) -> dict:
         """Execute Python code from AI response
 
@@ -2901,221 +3070,6 @@ async def _ai_generated_code():
                 'roi': getattr(position, 'roi', 0)
             }
 
-    def _get_required_indicators_for_trader(self, trader):
-        """Automatically determine required indicators based on trader profile
-
-        Args:
-            trader: Trader database record
-
-        Returns:
-            Dictionary mapping indicator script names to their arguments
-            {
-                'market_data.py': {'exchange': 'binance', 'symbol': 'BTCUSDT', 'interval': '1h'},
-                'fundingratehistory.py': {'exchange': 'binance', 'symbol': 'BTCUSDT'},
-                ...
-            }
-        """
-        import json
-        import re
-
-        # Strategy keyword to indicator mapping
-        STRATEGY_KEYWORD_MAP = {
-            # Price action related
-            'price_action': 'market_data.py',
-            'ohlcv': 'market_data.py',
-            'trend': 'market_data.py',
-            'momentum': 'market_data.py',
-            'candles': 'market_data.py',
-            'klines': 'market_data.py',
-
-            # Funding rate related
-            'funding_rate': 'fundingratehistory.py',
-            'funding': 'fundingratehistory.py',
-            'futures': 'fundingratehistory.py',
-
-            # Order book related
-            'orderbook': 'fetch_orderbook.py',
-            'order_flow': 'fetch_orderbook.py',
-            'liquidity': 'fetch_orderbook.py',
-            'depth': 'fetch_orderbook.py',
-
-            # Open interest related
-            'open_interest': 'fetch_open_interest.py',
-            'oi': 'fetch_open_interest.py',
-            'leverage': 'fetch_open_interest.py',
-
-            # Long/short ratio related
-            'long_short_ratio': 'longshortratio.py',
-            'lsr': 'longshortratio.py',
-            'sentiment': 'longshortratio.py',
-            'positioning': 'longshortratio.py',
-
-            # Combinations
-            'liquidation': ['fetch_orderbook.py', 'longshortratio.py'],
-            'squeeze': ['fetch_orderbook.py', 'fundingratehistory.py'],
-            'arbitrage': ['fetch_orderbook.py', 'fundingratehistory.py'],
-            'basis': ['fetch_orderbook.py', 'fundingratehistory.py'],
-        }
-
-        # Get trader's profile content
-        trader_file = Path(trader['trader_file'])
-        if trader_file.exists():
-            profile_content = trader_file.read_text(encoding='utf-8').lower()
-        else:
-            profile_content = ''
-
-        # Get trading pairs and normalize symbols
-        trading_pairs = json.loads(trader['trading_pairs']) if isinstance(trader.get('trading_pairs'), str) else trader.get('trading_pairs', [])
-
-        # Normalize symbols: ensure they end with USDT and clean up bad data
-        def normalize_symbol(symbol: str) -> str:
-            """Normalize trading pair symbol to proper format"""
-            if not symbol:
-                return "BTCUSDT"
-
-            # Remove whitespace
-            symbol = symbol.strip()
-
-            # Skip obvious bad data (long text, contains spaces, etc.)
-            if len(symbol) > 20 or ' ' in symbol or '(' in symbol:
-                return "BTCUSDT"
-
-            # Convert to uppercase
-            symbol = symbol.upper()
-
-            # Add USDT suffix if missing
-            if not symbol.endswith('USDT') and not symbol.endswith('USDC') and not symbol.endswith('BUSD'):
-                # Check if it's a common crypto symbol
-                common_quotes = ['USDT', 'USDC', 'BUSD', 'USD', 'EUR', 'GBP']
-                has_quote = any(symbol.endswith(q) for q in common_quotes)
-                if not has_quote:
-                    symbol = symbol + 'USDT'
-
-            return symbol
-
-        # Clean and normalize trading pairs
-        normalized_pairs = []
-        for pair in trading_pairs:
-            normalized = normalize_symbol(str(pair))
-            if normalized not in normalized_pairs:
-                normalized_pairs.append(normalized)
-
-        trading_pairs = normalized_pairs if normalized_pairs else ["BTCUSDT"]
-        default_symbol = trading_pairs[0]
-        default_exchange = "binance"
-
-        # Extract "Strategy Keywords" section if present
-        strategy_keywords = []
-        keywords_match = re.search(r'strategy keywords?:\s*(.+)', profile_content, re.MULTILINE)
-        if keywords_match:
-            keywords_str = keywords_match.group(1)
-            # Clean up markdown formatting and split by comma
-            # Remove common markdown symbols: **, *, `, `
-            keywords_str = re.sub(r'[\*\`]+', ' ', keywords_str)
-            # Split by comma and clean
-            strategy_keywords = [k.strip().lower() for k in keywords_str.split(',') if k.strip() and k.strip() not in ['', '**', '``']]
-        else:
-            # Fallback: scan entire profile for keywords
-            for keyword in STRATEGY_KEYWORD_MAP.keys():
-                if keyword.replace('_', ' ') in profile_content or keyword in profile_content:
-                    if keyword not in strategy_keywords:
-                        strategy_keywords.append(keyword)
-
-        # Deduce default interval from timeframes if available
-        default_interval = '1h'
-        timeframes = trader.get('timeframes', [])
-        if timeframes:
-            # Pick the shortest timeframe for precision
-            tf_map = {'1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d'}
-            for tf in timeframes:
-                if tf in tf_map:
-                    default_interval = tf_map[tf]
-                    break
-
-        # Build required indicators dictionary
-        required_indicators = {}
-
-        for keyword in strategy_keywords:
-            indicators = STRATEGY_KEYWORD_MAP.get(keyword, [])
-
-            # Handle single indicator
-            if isinstance(indicators, str):
-                indicators = [indicators]
-
-            # Handle list of indicators
-            for indicator_script in indicators:
-                # Skip if already added
-                if indicator_script in required_indicators:
-                    continue
-
-                # Build arguments based on script type
-                args = {
-                    'exchange': default_exchange,
-                    'symbol': default_symbol
-                }
-
-                # Add script-specific arguments
-                if indicator_script == 'market_data.py':
-                    args['interval'] = default_interval
-                elif indicator_script == 'fundingratehistory.py':
-                    args['limit'] = 100
-                elif indicator_script == 'longshortratio.py':
-                    args['period'] = '5m'
-                    args['limit'] = 100
-                elif indicator_script == 'fetch_orderbook.py':
-                    args['limit'] = 20
-
-                required_indicators[indicator_script] = args
-
-        return required_indicators
-
-    async def _auto_fetch_indicators(self, trader, verbose=True):
-        """Automatically fetch required indicators based on trader profile
-
-        Args:
-            trader: Trader database record
-            verbose: Whether to print progress messages
-
-        Returns:
-            Dictionary of indicator results (CSV strings)
-        """
-        import json
-
-        required_indicators = self._get_required_indicators_for_trader(trader)
-
-        if not required_indicators:
-            if verbose:
-                self.console.print("[dim]No indicators configured for this trader[/dim]")
-            return {}
-
-        if verbose:
-            indicator_names = [k.replace('.py', '') for k in required_indicators.keys()]
-            self.console.print(f"[Auto-fetching indicators: {', '.join(indicator_names)}]")
-
-        results = {}
-
-        for script_name, args in required_indicators.items():
-            # Build command line arguments
-            cmd_args = []
-            for key, value in args.items():
-                cmd_args.extend([f'--{key}', str(value)])
-
-            # Run the indicator
-            if verbose:
-                print(f"[indicator] running {script_name}: {' '.join(cmd_args)}")
-
-            try:
-                data = await self._run_indicator(script_name, cmd_args)
-                if data and not data.startswith("error"):
-                    results[script_name.replace('.py', '')] = data
-                elif verbose:
-                    self.console.print(f"[Warning] {script_name} failed or returned error")
-            except Exception as e:
-                if verbose:
-                    self.console.print(f"[Warning] Error running {script_name}: {e}")
-
-        return results
-
     def _build_phase1_prompt(self, context):
         """Build Phase 1 prompt for initial AI assessment
 
@@ -3143,7 +3097,7 @@ async def _ai_generated_code():
         indicators = self._discover_indicators()
 
         # Format indicators list for prompt
-        indicators_text = "Available indicators (CSV format):\n"
+        indicators_text = "Available indicators:\n\n"
         for script_name, meta in indicators.items():
             name_without_ext = script_name.replace('.py', '')
             params_desc = ', '.join([p for p in meta['parameters'] if not p.startswith('--')])
@@ -3152,11 +3106,21 @@ async def _ai_generated_code():
             else:
                 output_desc = '(CSV output)'
             indicators_text += f"- {name_without_ext}: {meta['description'][:60]} {output_desc}\n"
+            indicators_text += f"  Parameters: {', '.join(meta['parameters'])}\n\n"
+
+        # Build default parameters for common indicators
+        default_pair = trader['trading_pairs'][0] if trader['trading_pairs'] else 'BTCUSDT'
+        default_timeframe = trader['timeframes'][0] if trader['timeframes'] else '1h'
+
+        # Get default exchange from config
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        default_exchange = config.get_string('indicator.exchange', 'okx')
 
         return f"""You are a trading decision engine for trader {trader['id']}.
 
 TRADER PROFILE:
-{trader['profile_content']}
+{trader['profile_content'][:2000]}
 
 TRADER DATA:
 - Balance: ${trader['balance']:.2f}
@@ -3165,38 +3129,37 @@ TRADER DATA:
 - Timeframes: {', '.join(trader['timeframes'])}
 {pos_info}
 
-IMPORTANT: Market data relevant to your strategy has been automatically fetched based on your trader profile. You will receive this data in the next phase.
+YOUR TASK - PHASE 1: SELECT INDICATORS
 
-For now, your task is to:
-1. Analyze your trader's strategy and current position
-2. Identify if you need ADDITIONAL data beyond what will be automatically provided
-3. Make your preliminary assessment
+Based on the trader's strategy and current situation, select which market data indicators you need to make an informed trading decision.
 
-IMPORTANT: You MUST show your detailed thinking process before giving your decision. Format your response as:
-
-**THINKING:**
-[Your detailed analysis and reasoning here]
-- Consider the trader's strategy and current market conditions
-- Evaluate current positions and their performance
-- Identify what data you expect to receive vs what additional data you might need
-
-**DECISION:**
-[Your final decision - use one of the formats below]
-
-Available additional indicators you can request:
 {indicators_text}
 
-Decision options:
-- PROCEED_WITH_AUTO_FETCHED_DATA (use the automatically provided data)
-- NEED_INDICATOR <script_name> <exchange> <symbol> [additional_params...]
+**IMPORTANT:**
+- Default exchange: {default_exchange}
+- Default symbol: {default_pair}
+- Default timeframe: {default_timeframe}
 
-You can request MULTIPLE additional indicators by listing them each on a new line:
+You must select indicators using the exact format below. Each indicator goes on a NEW line with proper parameter names:
 
-**DECISION:**
-NEED_INDICATOR market_data.py binance BTCUSDT 4h
-NEED_INDICATOR fetch_orderbook.py binance ETHUSDT
+**THINKING:**
+[Analyze the trader's strategy and what data is needed]
 
-Note: Most required data (funding rates, orderbook, sentiment) has already been auto-fetched based on your strategy keywords. Only request additional indicators if you need something beyond the standard set.
+**SELECTED_INDICATORS:**
+<script_name> --exchange <exchange> --symbol <symbol> [--interval <interval>] [--limit <n>] [--period <period>]
+
+Example (exact format):
+**SELECTED_INDICATORS:**
+market_data.py --exchange {default_exchange} --symbol {default_pair} --interval {default_timeframe}
+fetch_orderbook.py --exchange {default_exchange} --symbol {default_pair} --limit 20
+longshortratio.py --exchange {default_exchange} --symbol {default_pair} --period 5m --limit 100
+
+CRITICAL:
+- Use EXACTLY the format shown above with --parameter-name value
+- Each indicator on a NEW line
+- Do NOT use bullet points, dashes, or arrows
+- Do NOT add descriptions or explanations after the indicators
+- Only select the essential indicators for this trader's strategy
 
 Begin your analysis:"""
 
@@ -3535,7 +3498,11 @@ Begin your analysis and action:"""
         # Parse trading pairs from trader
         trading_pairs = json.loads(trader['trading_pairs']) if isinstance(trader.get('trading_pairs'), str) else trader.get('trading_pairs', [])
         default_symbol = trading_pairs[0] if trading_pairs else "BTCUSDT"
-        default_exchange = "binance"
+
+        # Get default exchange from config
+        from .scheduler_config import get_scheduler_config
+        config = get_scheduler_config()
+        default_exchange = config.get_string('indicator.exchange', 'okx')
 
         import re
 
@@ -3634,11 +3601,16 @@ Begin your analysis and action:"""
                             script_args.extend(['--interval', arg])
                         i += 1
 
+                # Apply config settings: force use configured exchange
+                # Remove existing --exchange if present, then use config value
+                script_args = [arg for i, arg in enumerate(script_args) if not (arg == '--exchange' or (i > 0 and script_args[i-1] == '--exchange'))]
+                script_args.extend(["--exchange", default_exchange])
+
                 # Add limit if configured and script supports it
-                from .scheduler_config import get_scheduler_config
-                config = get_scheduler_config()
                 limit_config = config.get_int('indicator.limit', 0)
                 if limit_config > 0 and self._script_has_limit_param(script_name):
+                    # Remove existing --limit if present, then use config value
+                    script_args = [arg for i, arg in enumerate(script_args) if not (arg == '--limit' or (i > 0 and script_args[i-1] == '--limit'))]
                     script_args.extend(["--limit", str(limit_config)])
 
                 # Run the indicator
@@ -4026,11 +3998,15 @@ Begin your analysis and action:"""
                     self.console.print(f"[red]Error: Invalidexitoutprice '{args[1]}'[/red]")
                     return
             else:
-                # Fetch current price
+                # Fetch current price using configured exchange
                 try:
+                    from .scheduler_config import get_scheduler_config
+                    config = get_scheduler_config()
+                    configured_exchange = config.get_string('indicator.exchange', 'okx')
+
                     price_service = get_price_service()
                     exit_price = await price_service.fetch_current_price(
-                        position.exchange,
+                        configured_exchange,
                         position.symbol
                     )
                     self.console.print(f"[dim]whenfirstprice: {exit_price:.2f}[/dim]")
@@ -4038,9 +4014,12 @@ Begin your analysis and action:"""
                     self.console.print(f"[red]Error: fetchpricefailed: {e}[/red]")
                     return
 
-            # Calculate exit fee
+            # Calculate exit fee using configured exchange
             try:
-                exit_fee = calculate_fee(position.exchange, position.position_size, exit_price)
+                from .scheduler_config import get_scheduler_config
+                config = get_scheduler_config()
+                configured_exchange = config.get_string('indicator.exchange', 'okx')
+                exit_fee = calculate_fee(configured_exchange, position.position_size, exit_price)
             except Exception as e:
                 self.console.print(f"[red]Error: Calculate feefailed: {e}[/red]")
                 return

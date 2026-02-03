@@ -277,7 +277,10 @@ class PositionDatabase:
         # Calculate exit fee if not provided
         if exit_fee is None:
             from .fees import calculate_fee
-            exit_fee = calculate_fee(position.exchange, position.position_size, exit_price)
+            from .scheduler_config import get_scheduler_config
+            config = get_scheduler_config()
+            configured_exchange = config.get_string('indicator.exchange', 'okx')
+            exit_fee = calculate_fee(configured_exchange, position.position_size, exit_price)
 
         # Calculate realized PnL
         # Note: Leverage affects margin requirement but NOT the PnL calculation
