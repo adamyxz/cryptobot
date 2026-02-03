@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Database
+*.db
+
+# macOS
+.DS_Store
+
+# Virtual Environment
+.venv/
+venv/
+
+# Generated traders
+traders/*/
+
+# Logs
+*.log
